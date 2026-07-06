@@ -35,3 +35,9 @@ CREATE TABLE IF NOT EXISTS assayer_quarantine (
 
 CREATE INDEX IF NOT EXISTS idx_assayer_quarantine_pipeline_status
     ON assayer_quarantine (pipeline, status);
+
+-- Self-hosted Supabase: PostgREST serves the REST API under the service_role /
+-- anon roles and caches the schema; without these the new tables 404 via supabase-py.
+GRANT ALL ON TABLE assayer_traces, assayer_quarantine TO service_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO service_role;
+NOTIFY pgrst, 'reload schema';
