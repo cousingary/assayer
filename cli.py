@@ -108,6 +108,8 @@ def _cmd_quarantine_list(store, args):
                 reasons = json.loads(reasons)
             except Exception:
                 reasons = []
+        if isinstance(reasons, dict):
+            reasons = [f"{k}: {v}" for k, v in reasons.items()]
         first_reason = str(reasons[0]) if reasons else ""
         if len(first_reason) > 60:
             first_reason = first_reason[:60]
