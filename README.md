@@ -11,7 +11,7 @@ Verification + trace layer for unattended LLM pipelines running on a VPS.
 4. On fail, `assayer.quarantine_item(store, pipeline=, item_hash=, payload=,
    input_ref=, reasons=result.failed)` persists it for `assay` review. Never raises.
 `assayer.store.Store` imports `supabase` lazily (tests need no install).
-Deploy target: `/home/lamkin/assayer/`.
+Deploy target: `/opt/assayer/`.
 ## Example wiring
 ```python
 from assayer import item_hash, verify, trace, quarantine_item
@@ -21,10 +21,10 @@ store = Store()  # url/key from SUPABASE_URL / SUPABASE_SERVICE_KEY env
 item = {"body": llm_output}
 h = item_hash(item["body"])
 result = verify(item, [schema({"body": str}), nonempty("body"), max_len("body")])
-trace(store, pipeline="tarotsmith", job_id=job_id, item_hash=h,
+trace(store, pipeline="content_pipeline", job_id=job_id, item_hash=h,
       verdict=result.verdict, checks=result.checks, model="gpt-4.1-mini")
 if result.verdict != "pass":
-    quarantine_item(store, pipeline="tarotsmith", item_hash=h,
+    quarantine_item(store, pipeline="content_pipeline", item_hash=h,
                      payload=item, input_ref=job_id, reasons=result.failed)
 ```
-`assay` CLI (`cli.py`): quarantine/stats, incl. `--brief` for the morning brief.
+`assay` CLI (`cli.py`): quarantine/stats, incl. `--brief` for a daily digest.

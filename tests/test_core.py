@@ -31,7 +31,7 @@ class TraceTests(unittest.TestCase):
         store = FakeStore()
         trace(
             store,
-            pipeline="tarotsmith",
+            pipeline="content_pipeline",
             job_id="job-1",
             item_hash="abc123",
             verdict="pass",
@@ -45,7 +45,7 @@ class TraceTests(unittest.TestCase):
         )
         self.assertEqual(len(store.traces), 1)
         row = store.traces[0]
-        self.assertEqual(row["pipeline"], "tarotsmith")
+        self.assertEqual(row["pipeline"], "content_pipeline")
         self.assertEqual(row["job_id"], "job-1")
         self.assertEqual(row["item_hash"], "abc123")
         self.assertEqual(row["verdict"], "pass")

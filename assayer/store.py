@@ -14,7 +14,7 @@ class Store:
         self.url = url or os.environ.get("SUPABASE_URL")
         self.key = key or os.environ.get("SUPABASE_SERVICE_KEY")
         self.fallback_path = fallback_path or os.environ.get(
-            "ASSAYER_FALLBACK", "/home/lamkin/assayer/assayer_fallback.jsonl"
+            "ASSAYER_FALLBACK", "/opt/assayer/assayer_fallback.jsonl"
         )
         self._client = None
 

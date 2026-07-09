@@ -34,13 +34,13 @@ class ComputeStatsTests(unittest.TestCase):
     def test_aggregates_pipeline_and_model_counts(self):
         rows = [
             {
-                "pipeline": "tarotsmith",
+                "pipeline": "content_pipeline",
                 "verdict": "pass",
                 "model": "gpt-4.1-mini",
                 "checks_json": {"schema": {"ok": True, "detail": "ok"}},
             },
             {
-                "pipeline": "tarotsmith",
+                "pipeline": "content_pipeline",
                 "verdict": "fail",
                 "model": None,
                 "checks_json": {
@@ -50,8 +50,8 @@ class ComputeStatsTests(unittest.TestCase):
             },
         ]
         per_pipeline, per_check_fail, per_model = compute_stats(rows)
-        self.assertEqual(per_pipeline["tarotsmith"]["pass"], 1)
-        self.assertEqual(per_pipeline["tarotsmith"]["fail"], 1)
+        self.assertEqual(per_pipeline["content_pipeline"]["pass"], 1)
+        self.assertEqual(per_pipeline["content_pipeline"]["fail"], 1)
         self.assertEqual(per_check_fail["nonempty:body"], 1)
         self.assertEqual(per_model["unknown"]["fail"], 1)
         self.assertEqual(per_model["gpt-4.1-mini"]["pass"], 1)
