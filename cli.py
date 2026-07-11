@@ -5,9 +5,11 @@ optionally `python-dotenv` for local env loading.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -17,9 +19,17 @@ try:
 except ImportError:
     pass
 
+from assayer import profiles as profiles_mod
+from assayer import verify_scored
 from assayer.store import Store
 
 _SINCE_RE = re.compile(r"^(\d+)([dh])$")
+
+# Wire-protocol version for the `evaluate` request/response shape (Phase 3A
+# Governator<->Assayer bridge). Bump only if the JSON fields themselves
+# change in an incompatible way; profile-content changes do not need a bump
+# here (each profile can carry its own semver later, in 3B).
+EVALUATE_PROTOCOL_VERSION = "gov-assay-evaluate-v1"
 
 
 def parse_since(value: str) -> str:
@@ -92,6 +102,9 @@ def _build_parser():
     stats = sub.add_parser("stats")
     stats.add_argument("--since", default="7d")
     stats.add_argument("--brief", action="store_true")
+
+    evaluate = sub.add_parser("evaluate")
+    evaluate.add_argument("--profile", default=None)
 
     return parser
 
@@ -198,9 +211,105 @@ def _cmd_stats(store, args):
         )
 
 
+def _checks_hash(checks: dict) -> str:
+    """sha256 of the canonical (sorted-key) JSON of a verify() checks dict.
+    Deterministic for a given check set + outcome, independent of any
+    randomly-generated id (trace_id), so a caller can detect "same checks,
+    same result" across two evaluations without re-diffing."""
+    canonical = json.dumps(checks, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _verdict_payload(verdict, failed_checks, had_error, checks_hash, policy_version, reason=None):
+    payload = {
+        "verdict": verdict,
+        "failed_checks": failed_checks,
+        "had_error": had_error,
+        # trace_id/quarantine_id: locally-generated identifiers only. 3A has
+        # no async persistence wired up (no Store calls on this offline
+        # path) — a real trace/quarantine row is 3B/3C work, not this one's.
+        "trace_id": str(uuid.uuid4()),
+        "quarantine_id": "",
+        "checks_hash": checks_hash,
+        "policy_version": policy_version,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    return payload
+
+
+def _emit(payload):
+    print(json.dumps(payload))
+
+
+def _cmd_evaluate(args, stdin_text=None):
+    """Read one evaluate request from stdin (or `stdin_text`, for tests),
+    run the named check profile, and write one verdict JSON object to
+    stdout. Never touches the network or a Store (Phase 3A: synchronous,
+    offline, local-only bridge — see plan Phase 3, subsection 3A).
+
+    Always writes valid JSON and returns 0 for any *handled* outcome
+    (pass/advisory/fail/error alike) — an "error" verdict is itself a
+    successfully-computed, well-formed result, not a crash. Governator's
+    subprocess caller treats a nonzero exit as its own separate ERROR
+    fallback for cases where even this handler couldn't run (e.g. the
+    interpreter itself failing), so returning 0 here whenever we managed to
+    emit a verdict keeps the two signaling paths from conflicting.
+    """
+    raw = stdin_text if stdin_text is not None else sys.stdin.read()
+
+    try:
+        request = json.loads(raw)
+    except Exception as exc:
+        _emit(_verdict_payload(
+            "error", [], True, _checks_hash({}), None,
+            reason=f"malformed JSON on stdin: {exc}",
+        ))
+        return 0
+
+    if not isinstance(request, dict):
+        _emit(_verdict_payload(
+            "error", [], True, _checks_hash({}), None,
+            reason="request must be a JSON object",
+        ))
+        return 0
+
+    # Echo the caller's policy_version if given; otherwise fall back to this
+    # bridge's own wire-protocol version so the field is never silently null.
+    policy_version = request.get("policy_version") or EVALUATE_PROTOCOL_VERSION
+    profile_name = args.profile or request.get("check_profile") or ""
+    profile = profiles_mod.get_profile(profile_name)
+    if profile is None:
+        _emit(_verdict_payload(
+            "error", [], True, _checks_hash({}), policy_version,
+            reason=f"unknown or empty check_profile: {profile_name!r}",
+        ))
+        return 0
+
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    item = dict(payload)
+    item["artifact_name"] = request.get("artifact_name")
+    item["artifact_sha256"] = request.get("artifact_sha256")
+
+    live_checks = profiles_mod.build_checks(profile)
+    result = verify_scored(item, live_checks, enforcement=profile["enforcement"])
+    checks_hash = _checks_hash(result.checks)
+
+    _emit(_verdict_payload(
+        result.verdict, result.failed, result.had_error, checks_hash, policy_version,
+    ))
+    return 0
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "evaluate":
+        return _cmd_evaluate(args)
+
     store = Store()
 
     if args.command == "quarantine":
@@ -214,7 +323,8 @@ def main(argv=None):
             _cmd_quarantine_discard(store, args)
     elif args.command == "stats":
         _cmd_stats(store, args)
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))
