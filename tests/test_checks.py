@@ -212,6 +212,73 @@ class LanguageSaneCheckTests(unittest.TestCase):
         self.assertEqual(check.name, "language_sane:body")
 
 
+class FilePathConsistencyCheckTests(unittest.TestCase):
+    def test_pass_when_extension_matches_language(self):
+        check = checks.file_path_consistency()
+        ok, _ = check({"language": "python", "artifact_name": "output.py"})
+        self.assertTrue(ok)
+
+    def test_pass_case_insensitive(self):
+        check = checks.file_path_consistency()
+        ok, _ = check({"language": "Python", "artifact_name": "OUTPUT.PY"})
+        self.assertTrue(ok)
+
+    def test_fail_when_extension_mismatches_language(self):
+        check = checks.file_path_consistency()
+        ok, detail = check({"language": "python", "artifact_name": "output.js"})
+        self.assertFalse(ok)
+        self.assertIn("python", detail)
+
+    def test_pass_when_language_unregistered_deterministic(self):
+        check = checks.file_path_consistency()
+        ok, detail = check({"language": "cobol", "artifact_name": "output.cbl"})
+        self.assertTrue(ok)
+        self.assertIn("no known extensions", detail)
+
+    def test_fail_when_language_missing(self):
+        check = checks.file_path_consistency()
+        ok, _ = check({"artifact_name": "output.py"})
+        self.assertFalse(ok)
+
+    def test_fail_when_artifact_name_missing(self):
+        check = checks.file_path_consistency()
+        ok, _ = check({"language": "python"})
+        self.assertFalse(ok)
+
+    def test_name(self):
+        check = checks.file_path_consistency()
+        self.assertEqual(check.name, "file_path_consistency")
+
+
+class DomainValidatorCheckTests(unittest.TestCase):
+    def test_pass_on_valid_python(self):
+        check = checks.domain_validator()
+        ok, _ = check({"language": "python", "content": "def f():\n    return 1\n"})
+        self.assertTrue(ok)
+
+    def test_fail_on_invalid_python_syntax(self):
+        check = checks.domain_validator()
+        ok, detail = check({"language": "python", "content": "def f(:\n    return 1\n"})
+        self.assertFalse(ok)
+        self.assertIn("syntactically valid python", detail)
+
+    def test_pass_when_language_unregistered_deterministic(self):
+        check = checks.domain_validator()
+        ok, detail = check({"language": "cobol", "content": "anything"})
+        self.assertTrue(ok)
+        self.assertIn("no domain validator registered", detail)
+
+    def test_pass_when_language_missing(self):
+        check = checks.domain_validator()
+        ok, detail = check({"content": "anything"})
+        self.assertTrue(ok)
+        self.assertIn("no language declared", detail)
+
+    def test_name(self):
+        check = checks.domain_validator()
+        self.assertEqual(check.name, "domain_validator")
+
+
 class DedupCheckTests(unittest.TestCase):
     def test_pass_when_not_seen(self):
         store = FakeStore()

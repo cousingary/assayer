@@ -1,6 +1,9 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from assayer import item_hash, quarantine_item, trace
+from assayer.outbox import Outbox, OutboxError
 from tests.fake_store import FakeStore
 
 
@@ -118,22 +121,14 @@ class QuarantineItemTests(unittest.TestCase):
         self.assertEqual(row["payload_json"], {"body": "text"})
         self.assertEqual(row["reasons_json"], ["nonempty:body failed"])
 
-    def test_returns_none_on_store_failure(self):
+    def test_durably_queues_to_outbox_on_store_failure(self):
+        # Sol audit Assayer weakness 5: quarantine evidence is blocking, not
+        # optional telemetry, so a primary-insert failure must land in the
+        # durable local outbox (not the old silently-swallowing
+        # Store.fallback()) — verified here by reading the outbox file back.
         store = FakeStore(raise_on_insert_quarantine=True)
-        qid = quarantine_item(
-            store,
-            pipeline="p",
-            item_hash="h",
-            payload={"body": "text"},
-            input_ref="ref-1",
-            reasons=["bad"],
-        )
-        self.assertIsNone(qid)
-        self.assertEqual(len(store.fallback_calls), 1)
-
-    def test_never_raises_when_insert_and_fallback_both_fail(self):
-        store = FakeStore(raise_on_insert_quarantine=True, raise_on_fallback=True)
-        try:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Outbox(path=str(Path(tmp) / "quarantine_outbox.jsonl"))
             qid = quarantine_item(
                 store,
                 pipeline="p",
@@ -141,10 +136,35 @@ class QuarantineItemTests(unittest.TestCase):
                 payload={"body": "text"},
                 input_ref="ref-1",
                 reasons=["bad"],
+                outbox=outbox,
             )
-        except Exception as exc:
-            self.fail(f"quarantine_item() raised unexpectedly: {exc}")
-        self.assertIsNone(qid)
+            self.assertIsNone(qid)
+            self.assertEqual(len(store.fallback_calls), 0)
+            pending = outbox.pending()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["table_hint"], "assayer_quarantine")
+            self.assertEqual(pending[0]["row"]["payload_json"], {"body": "text"})
+
+    def test_raises_when_insert_and_outbox_both_fail(self):
+        # The one case Sol's weakness explicitly says must NOT be silently
+        # swallowed for blocking evidence: if even the durable outbox can't
+        # be written, that is genuine evidence loss and must propagate.
+        store = FakeStore(raise_on_insert_quarantine=True)
+
+        class AlwaysFailingOutbox:
+            def enqueue(self, table_hint, row):
+                raise OutboxError("disk full")
+
+        with self.assertRaises(OutboxError):
+            quarantine_item(
+                store,
+                pipeline="p",
+                item_hash="h",
+                payload={"body": "text"},
+                input_ref="ref-1",
+                reasons=["bad"],
+                outbox=AlwaysFailingOutbox(),
+            )
 
 
 if __name__ == "__main__":

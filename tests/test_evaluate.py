@@ -50,9 +50,26 @@ class EvaluateCLITests(unittest.TestCase):
         self.assertEqual(verdict["failed_checks"], [])
         self.assertFalse(verdict["had_error"])
         self.assertEqual(verdict["policy_version"], "test-policy-v1")
-        self.assertTrue(verdict["trace_id"])
+        # evaluation_id is always a real per-call id; trace_id stays null
+        # until a trace row is actually persisted (Sol audit Assayer
+        # weakness 4 — this bridge never persists one, it's offline/sync).
+        self.assertTrue(verdict["evaluation_id"])
+        self.assertIsNone(verdict["trace_id"])
         self.assertEqual(verdict["quarantine_id"], "")
-        self.assertTrue(verdict["checks_hash"])
+        self.assertTrue(verdict["checks_result_hash"])
+        self.assertTrue(verdict["profile_definition_hash"])
+        self.assertTrue(verdict["validator_implementation_hash"])
+        self.assertTrue(verdict["validator_config_hash"])
+        # The four hashes measure different things and must not collide.
+        self.assertEqual(
+            len({
+                verdict["checks_result_hash"],
+                verdict["profile_definition_hash"],
+                verdict["validator_implementation_hash"],
+                verdict["validator_config_hash"],
+            }),
+            4,
+        )
 
     def test_fail_verdict_missing_required_field(self):
         req = base_request(payload={})
@@ -93,10 +110,13 @@ class EvaluateCLITests(unittest.TestCase):
         proc2 = run_evaluate(req)
         v1 = json.loads(proc1.stdout)
         v2 = json.loads(proc2.stdout)
-        self.assertEqual(v1["checks_hash"], v2["checks_hash"])
-        # trace_id is randomly generated per call and must NOT be part of
-        # determinism (it's a per-evaluation id, not a content fingerprint).
-        self.assertNotEqual(v1["trace_id"], v2["trace_id"])
+        self.assertEqual(v1["checks_result_hash"], v2["checks_result_hash"])
+        self.assertEqual(v1["profile_definition_hash"], v2["profile_definition_hash"])
+        self.assertEqual(v1["validator_implementation_hash"], v2["validator_implementation_hash"])
+        self.assertEqual(v1["validator_config_hash"], v2["validator_config_hash"])
+        # evaluation_id is randomly generated per call and must NOT be part
+        # of determinism (it's a per-evaluation id, not a content fingerprint).
+        self.assertNotEqual(v1["evaluation_id"], v2["evaluation_id"])
 
     def test_placeholder_content_fails_no_placeholders_check(self):
         req = base_request(payload={"content": "TODO: fill this in with real content [placeholder]"})
@@ -112,6 +132,73 @@ class EvaluateCLITests(unittest.TestCase):
         verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "fail")
         self.assertIn("artifact_schema", verdict["failed_checks"])
+
+    def test_v2_rejects_sol_weakness1_reproduction(self):
+        # Sol audit Assayer Weakness 1: {"content": "x"} received
+        # {"verdict": "pass"} under coding-output-v1. coding-output-v2 must
+        # not repeat that: "x" is far under the minimum content length and
+        # `language` is entirely missing.
+        req = base_request(payload={"content": "x"}, check_profile="coding-output-v2")
+        proc = run_evaluate(req, profile="coding-output-v2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn("required_fields", verdict["failed_checks"])
+
+    def test_v2_pass_verdict_with_language_and_matching_extension(self):
+        req = base_request(
+            payload={
+                "content": "def add(a, b):\n    return a + b\n",
+                "language": "python",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="output.py",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
+
+    def test_v2_fails_on_file_path_language_mismatch(self):
+        req = base_request(
+            payload={
+                "content": "def add(a, b):\n    return a + b\n",
+                "language": "python",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="output.js",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn("file_path_consistency", verdict["failed_checks"])
+
+    def test_v2_fails_on_syntactically_invalid_python(self):
+        req = base_request(
+            payload={
+                "content": "def add(a, b:\n    return a + b\n",
+                "language": "python",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="output.py",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn("domain_validator", verdict["failed_checks"])
+
+    def test_v2_passes_unregistered_language_domain_validator(self):
+        req = base_request(
+            payload={
+                "content": "This is a sufficiently long piece of real generated markdown content.",
+                "language": "markdown",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="output.md",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
 
     def test_no_network_no_store_import_touched(self):
         # Regression: evaluate must never construct assayer.store.Store (no

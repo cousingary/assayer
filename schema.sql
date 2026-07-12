@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS assayer_traces (
     tokens_in integer,
     tokens_out integer,
     cost_usd numeric,
-    verdict text NOT NULL CHECK (verdict IN ('pass', 'fail', 'error')),
+    verdict text NOT NULL CHECK (verdict IN ('pass', 'fail', 'error', 'advisory')),
     checks_json jsonb,
     quarantine_id bigint,
     duration_ms integer

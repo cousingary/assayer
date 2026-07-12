@@ -1,0 +1,22 @@
+# Minimal CI definition (Sol audit Assayer weakness 6: "packaging and
+# dependency reproducibility" — ship the CI definition even though this
+# repo has no git remote today and nothing actually triggers it yet).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-lock.txt
+      - run: python3 -m pytest -q

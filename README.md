@@ -9,9 +9,30 @@ Verification + trace layer for unattended LLM pipelines running on a VPS.
 3. `assayer.trace(store, pipeline=, job_id=, item_hash=, verdict=, checks=,
    model=)` records the outcome. Never raises.
 4. On fail, `assayer.quarantine_item(store, pipeline=, item_hash=, payload=,
-   input_ref=, reasons=result.failed)` persists it for `assay` review. Never raises.
+   input_ref=, reasons=result.failed)` persists it for `assay` review. If the
+   primary Store insert fails, it durably queues the row to a local outbox
+   (`assayer.outbox.Outbox`, replayable via `Outbox.replay(store)`) instead
+   of the old best-effort fallback; it raises `assayer.outbox.OutboxError`
+   only if the outbox itself can't be written — quarantine evidence is
+   blocking, so a true double-failure is not silently swallowed. `trace()`
+   is unchanged (still best-effort, never raises — it's optional telemetry,
+   not blocking evidence).
 `assayer.store.Store` imports `supabase` lazily (tests need no install).
 Deploy target: `/opt/assayer/`.
+
+## Check profiles
+`assayer.profiles` registers named check-profile bundles for the
+Governator<->Assayer `evaluate` bridge: `coding-output-v1` (legacy, kept for
+compatibility) and `coding-output-v2` (adds a minimum content length,
+language sanity, a `language` field in the payload schema, file/path
+consistency between `language` and the artifact's file extension, and a
+per-language domain validator registry — see `assayer/checks.py`'s
+`file_path_consistency`/`domain_validator`). `cli.py evaluate`'s response
+includes four separate hashes: `checks_result_hash` (the outcome),
+`profile_definition_hash` (which profile), `validator_implementation_hash`
+(which checks.py), and `validator_config_hash` (which resolved check
+config) — deliberately not one combined hash, so each can be verified
+independently.
 ## Example wiring
 ```python
 from assayer import item_hash, verify, trace, quarantine_item
