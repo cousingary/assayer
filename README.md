@@ -20,6 +20,50 @@ Verification + trace layer for unattended LLM pipelines running on a VPS.
 `assayer.store.Store` imports `supabase` lazily (tests need no install).
 Deploy target: `/opt/assayer/`.
 
+## Durable quarantine outbox (`assayer.outbox`)
+
+`Outbox.enqueue()` appends an entry under an exclusive `fcntl` file lock, opened
+`O_CREAT|O_APPEND|O_WRONLY` at mode `0600`, and `fsync`s before closing — a
+crash right after enqueue can't lose the entry or leave it partially written.
+The file rotates past 10MB (`DEFAULT_MAX_BYTES`) to a timestamped sibling.
+`Outbox.replay(store)` retries every pending entry against a live `Store`:
+success removes it, failure increments an `attempts` counter, and after 5
+failed attempts (`DEFAULT_MAX_ATTEMPTS`) the entry moves to a `.deadletter`
+sibling file instead of retrying forever. This durable-outbox path is for
+blocking quarantine evidence only; `trace()`'s bare `except: pass` fallback
+remains scoped to optional telemetry, which is allowed to disappear silently.
+
+## Schema migrations
+
+`schema.sql` is the fresh-install schema; `migrations/000N_*.sql` are ordered,
+idempotent (`DROP CONSTRAINT IF EXISTS` / `IF NOT EXISTS`) deltas applied to an
+existing database. `migrations/0002_advisory_verdict.sql` widens
+`assayer_traces_verdict_check` to accept `advisory` alongside `pass`/`fail`/
+`error`, for a non-blocking verdict a profile can emit without treating it as
+a hard failure. `tests/test_schema_migrations.py` asserts the migrated schema
+and the fresh-install `schema.sql` agree on the exact accepted verdict set —
+run new migrations through that test when adding one.
+
+## Trace and evaluation identifiers
+
+`cli.py evaluate`'s response always includes a fresh `evaluation_id`
+(`uuid4`, unique per call — never part of any hash, since two identical
+requests must still get distinct ids). `trace_id` is honestly `null`: Phase
+3A's synchronous evaluator has no async persistence wired up, so there is no
+trace row yet for it to point at. A future caller that persists a trace row
+can set `trace_id` once that row exists; until then, treat a non-null
+`trace_id` as meaningful and a null one as "not traced," never as an error.
+
+## Packaging
+
+`pyproject.toml` pins `supabase>=2.0.0` and `python-dotenv>=1.0.0`
+(`requirements-lock.txt` records the fully resolved versions actually tested
+against), declares package version `1.1.0`, and requires Python `>=3.10`.
+Profile semantic versions are independent of the package version and live on
+each profile itself (`coding-output-v1` is `1.0.0`, `coding-output-v2` is
+`2.0.0` — see `assayer/profiles.py`). `.github/workflows/ci.yml` runs
+`pytest -q` from the lockfile across a Python 3.10/3.11/3.12 matrix.
+
 ## Check profiles
 `assayer.profiles` registers named check-profile bundles for the
 Governator<->Assayer `evaluate` bridge: `coding-output-v1` (legacy, kept for
