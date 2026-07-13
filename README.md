@@ -22,16 +22,33 @@ Deploy target: `/opt/assayer/`.
 
 ## Durable quarantine outbox (`assayer.outbox`)
 
-`Outbox.enqueue()` appends an entry under an exclusive `fcntl` file lock, opened
-`O_CREAT|O_APPEND|O_WRONLY` at mode `0600`, and `fsync`s before closing — a
-crash right after enqueue can't lose the entry or leave it partially written.
-The file rotates past 10MB (`DEFAULT_MAX_BYTES`) to a timestamped sibling.
-`Outbox.replay(store)` retries every pending entry against a live `Store`:
-success removes it, failure increments an `attempts` counter, and after 5
-failed attempts (`DEFAULT_MAX_ATTEMPTS`) the entry moves to a `.deadletter`
-sibling file instead of retrying forever. This durable-outbox path is for
-blocking quarantine evidence only; `trace()`'s bare `except: pass` fallback
-remains scoped to optional telemetry, which is allowed to disappear silently.
+`assayer.outbox.Outbox` is backed by a local SQLite database in WAL mode
+(`outbox_entries`, mode `0600`, default path `/opt/assayer/quarantine_outbox.db`
+/ `ASSAYER_OUTBOX`), not a JSONL file. This closes Sol redteam v3 finding #6:
+the earlier JSONL implementation locked individual reads/appends/rewrites,
+but not the whole `replay()` read-modify-rewrite, so an `enqueue()` landing
+while `replay()` was blocked inside the backing store got silently dropped
+when replay finished and rewrote the file from its stale snapshot.
+`Outbox.enqueue()` is a single atomic `INSERT`. `Outbox.replay(store, ...)`
+atomically claims a lease on every pending row (`UPDATE ... WHERE
+status='pending' ... RETURNING`) before doing any store I/O, so a concurrent
+enqueue can never land inside the claim window and two concurrent
+`replay()` callers (threads or processes) never claim the same row. A
+claimed row that never completes (process killed, hung) reverts to pending
+once its lease expires (`Outbox.reclaim_stale_leases()`, called at the top
+of every `replay()`) instead of vanishing. Rows that fail
+`DEFAULT_MAX_ATTEMPTS` (5) times move to `status='dead_letter'`
+(`Outbox.dead_letters()`) instead of retrying forever.
+
+`Outbox(path=...)` auto-migrates a pre-Sol3 JSONL outbox found at the same
+path (`Outbox.migrate_from_jsonl()`): the legacy file is moved aside to
+`<path>.pre-sqlite-migration` (kept, not deleted) and its lines — plus any
+`.deadletter` sibling — are inserted into the new table. Malformed lines are
+preserved as dead-lettered `malformed_migration` entries rather than
+discarded, and migration is idempotent (safe to run, or auto-trigger,
+twice). This durable-outbox path is for blocking quarantine evidence only;
+`trace()`'s bare `except: pass` fallback remains scoped to optional
+telemetry, which is allowed to disappear silently.
 
 ## Schema migrations
 
