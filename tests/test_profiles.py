@@ -21,7 +21,9 @@ class ProfileVersionTests(unittest.TestCase):
         v1 = profiles.get_profile("coding-output-v1")
         v2 = profiles.get_profile("coding-output-v2")
         self.assertEqual(v1["version"], "1.0.0")
-        self.assertEqual(v2["version"], "2.0.0")
+        # 2.1.0 (Sol audit finding #17): file_path_consistency's name_field
+        # moved from artifact_name to artifact_declared_path.
+        self.assertEqual(v2["version"], "2.1.0")
 
     def test_version_participates_in_profile_definition_hash(self):
         v1 = profiles.get_profile("coding-output-v1")
