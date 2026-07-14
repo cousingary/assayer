@@ -7,6 +7,13 @@ requires-python = ">=3.10"
 dependencies = [
     "supabase>=2.0.0",
     "python-dotenv>=1.0.0",
+    # Sol redteam v4, P1-13: optional authenticated encryption at rest for
+    # quarantine/trace evidence (assayer/evidence.py, opt-in via
+    # ASSAYER_EVIDENCE_KEY). Was already resolving transitively via
+    # supabase's own dependency chain (see the pinned freeze below) --
+    # declared directly now that assayer imports it itself, so it doesn't
+    # silently disappear if that transitive chain ever changes.
+    "cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]

@@ -145,6 +145,33 @@ class QuarantineItemTests(unittest.TestCase):
             self.assertEqual(pending[0]["table_hint"], "assayer_quarantine")
             self.assertEqual(pending[0]["row"]["payload_json"], {"body": "text"})
 
+    def test_redacts_sensitive_payload_before_storing(self):
+        store = FakeStore()
+        qid = quarantine_item(
+            store,
+            pipeline="p",
+            item_hash="h",
+            payload={"api_key": "sk-abcdefghijklmnopqrstuvwxyz123456", "content": "safe text"},
+            input_ref="ref-1",
+            reasons=["bad"],
+        )
+        self.assertEqual(qid, 1)
+        row = store.quarantine[0]
+        self.assertIn("[REDACTED:key:", row["payload_json"]["api_key"])
+        self.assertEqual(row["payload_json"]["content"], "safe text")
+        self.assertEqual(row["data_classification"], "sensitive")
+        self.assertFalse(row["payload_encrypted"])
+
+    def test_non_sensitive_payload_classified_standard_and_unmodified(self):
+        store = FakeStore()
+        quarantine_item(
+            store, pipeline="p", item_hash="h",
+            payload={"body": "text"}, input_ref="ref-1", reasons=["bad"],
+        )
+        row = store.quarantine[0]
+        self.assertEqual(row["payload_json"], {"body": "text"})
+        self.assertEqual(row["data_classification"], "standard")
+
     def test_raises_when_insert_and_outbox_both_fail(self):
         # The one case Sol's weakness explicitly says must NOT be silently
         # swallowed for blocking evidence: if even the durable outbox can't

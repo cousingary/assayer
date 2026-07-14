@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from assayer import evidence
 from assayer.outbox import Outbox, OutboxError
 
 
@@ -103,6 +104,14 @@ def trace(
     duration_ms=None,
 ) -> None:
     """Build a trace row and persist it. Never raises."""
+    # Sol redteam v4, P1-13: checks_json can carry a validator's rejection
+    # detail verbatim (e.g. a schema check echoing back offending field
+    # values), so it gets the same field-level redaction + size cap as
+    # quarantine's payload. Kept lightweight (no encryption) -- trace is
+    # best-effort telemetry, not the blocking evidence artifact quarantine
+    # is.
+    redacted_checks, checks_sensitive = evidence.classify_and_redact(checks)
+    redacted_checks, checks_capped = evidence.enforce_size_limit(redacted_checks)
     row = {
         "ts": _utc_now_iso(),
         "pipeline": pipeline,
@@ -113,9 +122,10 @@ def trace(
         "tokens_out": tokens_out,
         "cost_usd": cost_usd,
         "verdict": verdict,
-        "checks_json": checks,
+        "checks_json": redacted_checks,
         "quarantine_id": quarantine_id,
         "duration_ms": duration_ms,
+        "data_classification": evidence.classification_for(checks_sensitive or checks_capped),
     }
 
     try:
@@ -140,14 +150,29 @@ def quarantine_item(store, *, pipeline, item_hash, payload, input_ref, reasons, 
     full, permissions), that IS evidence loss and must not be silently
     absorbed — OutboxError propagates.
     """
+    # Sol redteam v4, P1-13: quarantine payloads/reasons are exactly where a
+    # secret leaks (source content, credentials, pasted user data) --
+    # redact by key name and known secret shape, cap the stored size, and
+    # (opt-in via ASSAYER_EVIDENCE_KEY) encrypt at rest. None of this
+    # changes behavior for a payload with nothing sensitive/oversized in it
+    # and no encryption key configured -- payload_json stays exactly the
+    # caller's dict, unmodified.
+    redacted_payload, payload_sensitive = evidence.classify_and_redact(payload)
+    redacted_payload, payload_capped = evidence.enforce_size_limit(redacted_payload)
+    redacted_reasons, reasons_sensitive = evidence.classify_and_redact(reasons)
+    classification = evidence.classification_for(payload_sensitive or reasons_sensitive or payload_capped)
+    stored_payload, encrypted = evidence.encrypt_if_configured(redacted_payload)
+
     row = {
         "ts": _utc_now_iso(),
         "pipeline": pipeline,
         "item_hash": item_hash,
-        "payload_json": payload,
+        "payload_json": stored_payload,
         "input_ref": input_ref,
-        "reasons_json": reasons,
+        "reasons_json": redacted_reasons,
         "status": "open",
+        "data_classification": classification,
+        "payload_encrypted": encrypted,
     }
 
     try:
