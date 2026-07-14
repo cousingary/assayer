@@ -52,7 +52,10 @@ class OutboxEnqueueTests(unittest.TestCase):
             pending = outbox.pending()
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0]["id"], entry_id)
-            self.assertEqual(pending[0]["row"], {"a": 1})
+            # event_id (the entry's own stable idempotency key, Sol redteam
+            # v4 P0-8) is injected into the row at enqueue time.
+            self.assertEqual(pending[0]["row"]["a"], 1)
+            self.assertEqual(pending[0]["row"]["event_id"], entry_id)
             self.assertEqual(pending[0]["status"], "pending")
 
     def test_db_file_created_with_0600_perms(self):
@@ -195,7 +198,9 @@ class Sol3OutboxConcurrencyTests(unittest.TestCase):
             replayed, still_pending, dead_lettered = result["value"]
             self.assertEqual(replayed, 1)
             self.assertEqual(dead_lettered, 0)
-            self.assertEqual(store.quarantine, [{"which": "a"}])
+            self.assertEqual(len(store.quarantine), 1)
+            self.assertEqual(store.quarantine[0]["which"], "a")
+            self.assertEqual(store.quarantine[0]["event_id"], entry_a)
 
             pending_ids = {e["id"] for e in outbox2.pending()}
             self.assertIn(entry_b, pending_ids, "entry enqueued during blocked replay must not be lost")
@@ -320,6 +325,237 @@ class Sol3OutboxMigrationTests(unittest.TestCase):
             outbox.migrate_from_jsonl(str(jsonl_path))
 
             self.assertEqual(len(outbox.pending()), 1, "second migration must not duplicate the entry")
+
+    def _tmp(self):
+        import tempfile
+
+        return tempfile.TemporaryDirectory()
+
+
+class SharedIdempotentStore:
+    """Shared downstream store for two concurrent workers (Sol redteam v4,
+    P0-8 attack 13): the FIRST insert_quarantine call blocks until
+    released, simulating the slow write whose lease expires mid-flight;
+    every call honors event_id-based idempotency the way the real
+    Supabase upsert-on-conflict does."""
+
+    def __init__(self):
+        self.quarantine = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._first_call_done = False
+        self._lock = threading.Lock()
+
+    def insert_quarantine(self, row):
+        with self._lock:
+            first = not self._first_call_done
+            self._first_call_done = True
+        if first:
+            self.entered.set()
+            self.release.wait(timeout=5)
+        with self._lock:
+            event_id = row.get("event_id")
+            existing = next((r for r in self.quarantine if r.get("event_id") == event_id), None)
+            if existing is not None:
+                return existing["id"]
+            qid = len(self.quarantine) + 1
+            row_copy = dict(row)
+            row_copy["id"] = qid
+            self.quarantine.append(row_copy)
+            return qid
+
+    def insert_trace(self, row):
+        return row
+
+
+class Sol4OutboxDuplicateProcessingTests(unittest.TestCase):
+    """Report §9 attacks 13/14 (P0-8): lease-expiry double-processing and
+    crash-between-insert-and-delete double-processing. Both must leave
+    exactly one row in the downstream store, never two."""
+
+    def test_attack13_two_workers_reclaim_one_expired_lease_no_duplicate_insert(self):
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
+            store = SharedIdempotentStore()
+
+            result = {}
+
+            def worker_a():
+                result["a"] = outbox.replay(store, lease_seconds=0.05)
+
+            ta = threading.Thread(target=worker_a)
+            ta.start()
+            self.assertTrue(store.entered.wait(timeout=5), "worker a never entered the slow insert")
+            time.sleep(0.2)  # worker a's short lease is now expired
+
+            # A second worker (independent Outbox instance/connection --
+            # the real two-process scenario) reclaims the stale lease and
+            # processes the same entry while worker a is still inside its
+            # slow insert.
+            outbox_b = Outbox(path=path)
+            replayed_b, still_pending_b, dead_b = outbox_b.replay(store)
+
+            store.release.set()
+            ta.join(timeout=5)
+            replayed_a, still_pending_a, dead_a = result["a"]
+
+            self.assertEqual(
+                len(store.quarantine), 1,
+                "attack 13: lease-expiry race must not insert the same entry twice downstream",
+            )
+            self.assertEqual(replayed_b, 1)
+            # worker a's own completion must not claim credit for a row it
+            # no longer owned the lease on by the time its slow insert
+            # finally returned (Sol redteam v4: never report success on a
+            # zero-row completion).
+            self.assertEqual(replayed_a, 0)
+
+    def test_attack14_crash_between_downstream_insert_and_outbox_delete_is_idempotent(self):
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            entry_id = outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
+            store = FakeStore()
+
+            # Simulate a worker that claims the entry, successfully inserts
+            # it downstream, then crashes before marking the outbox entry
+            # complete at all -- the outbox row is left behind, still
+            # 'processing'.
+            claimed, _ = outbox._claim_batch("crashing-worker", time.time() + 60, 10)
+            self.assertEqual(len(claimed), 1)
+            store.insert_quarantine(claimed[0]["row"])
+            self.assertEqual(len(store.quarantine), 1)
+            # (crash here -- no _complete_success/_complete_failure call)
+
+            # Restart: force this test's lease to look expired instead of
+            # sleeping out a real lease window.
+            with outbox._conn:
+                outbox._conn.execute(
+                    "UPDATE outbox_entries SET lease_until=0 WHERE id=?", (entry_id,)
+                )
+
+            replayed, still_pending, dead_lettered = outbox.replay(store)
+
+            self.assertEqual(replayed, 1)
+            self.assertEqual(
+                len(store.quarantine), 1,
+                "attack 14: reprocessing after a crash must not duplicate the downstream insert",
+            )
+
+    def _tmp(self):
+        import tempfile
+
+        return tempfile.TemporaryDirectory()
+
+
+class Sol4OutboxRobustnessTests(unittest.TestCase):
+    def test_malformed_payload_json_does_not_poison_the_claimed_batch(self):
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            outbox.enqueue("assayer_quarantine", {"good": 1})
+            outbox.enqueue("assayer_quarantine", {"good": 2})
+            corrupt_id = outbox.enqueue("assayer_quarantine", {"good": 3})
+            # Corrupt one entry's payload directly, as if the on-disk row
+            # were damaged independently of anything Outbox itself wrote.
+            with outbox._conn:
+                outbox._conn.execute(
+                    "UPDATE outbox_entries SET payload='{not valid json' WHERE id=?",
+                    (corrupt_id,),
+                )
+
+            store = FakeStore()
+            replayed, still_pending, dead_lettered = outbox.replay(store)
+
+            self.assertEqual(replayed, 2, "the two good entries must still be processed")
+            self.assertEqual(dead_lettered, 1, "the corrupt entry must be dead-lettered, not crash the batch")
+            self.assertEqual(still_pending, 0)
+            dead = outbox.dead_letters()
+            self.assertEqual(len(dead), 1)
+            self.assertIn("unparseable payload", dead[0]["last_error"])
+
+    def test_parent_directory_created_with_0700_perms(self):
+        import os
+
+        with self._tmp() as tmp:
+            path = Path(tmp) / "nested" / "outbox.db"
+            Outbox(path=str(path))
+            mode = os.stat(path.parent).st_mode & 0o777
+            self.assertEqual(mode, 0o700)
+
+    def test_stale_reclaim_dead_letters_once_max_attempts_exhausted(self):
+        # A worker that crashes on every single claim (before ever raising
+        # an explicit failure) must still burn down to dead_letter instead
+        # of being reclaimed forever (Sol redteam v4: every claim AND every
+        # stale reclaim counts as an attempt).
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path, max_attempts=2)
+            entry_id = outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
+
+            for _ in range(2):
+                claimed, _ = outbox._claim_batch(f"crashing-worker-{_}", time.time() + 60, 10)
+                self.assertEqual(len(claimed), 1)
+                # simulate the lease already having expired (crash, no
+                # completion call at all)
+                with outbox._conn:
+                    outbox._conn.execute(
+                        "UPDATE outbox_entries SET lease_until=0 WHERE id=?", (entry_id,)
+                    )
+                outbox.reclaim_stale_leases()
+
+            self.assertEqual(len(outbox.pending()), 0)
+            dead = outbox.dead_letters()
+            self.assertEqual(len(dead), 1)
+            self.assertEqual(dead[0]["attempts"], 2)
+
+    def test_pending_surfaces_a_stale_processing_row_without_an_explicit_replay(self):
+        # Sol redteam v4: pending() must not omit an "active" row whose
+        # lease has already expired -- an operator asking "what's
+        # actionable right now" shouldn't undercount a crashed worker's
+        # abandoned entry just because nobody has called replay() since.
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            entry_id = outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
+            outbox._claim_batch("stalled-worker", time.time() + 60, 10)
+            self.assertEqual(len(outbox.pending()), 0, "lease not yet expired")
+
+            with outbox._conn:
+                outbox._conn.execute(
+                    "UPDATE outbox_entries SET lease_until=0 WHERE id=?", (entry_id,)
+                )
+
+            pending = outbox.pending()
+            self.assertEqual(len(pending), 1, "stale lease must self-heal back into pending()")
+            self.assertEqual(pending[0]["id"], entry_id)
+
+    def test_outbox_instance_usable_from_multiple_threads(self):
+        # Sol redteam v4: a single Outbox object shared across threads must
+        # not crash or corrupt state -- each thread gets its own
+        # connection via the thread-local property.
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            errors = []
+
+            def enqueue_many(n):
+                try:
+                    for i in range(n):
+                        outbox.enqueue("assayer_quarantine", {"i": i})
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=enqueue_many, args=(20,)) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(outbox.pending()), 80)
 
     def _tmp(self):
         import tempfile

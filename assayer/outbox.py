@@ -19,11 +19,31 @@ dropped when replay finishes and rewrites the file from its stale
 in-memory snapshot. This module replaces that file with a SQLite WAL-backed
 table so enqueue and claim/complete are each a single atomic statement —
 there is no read-modify-write window for a concurrent writer to fall into.
+
+Sol redteam v4, P0-8 ("duplicate outbox processing"): the WAL-backed table
+above still let a stale-but-not-yet-reclaimed lease and a later reclaim
+race a real downstream insert -- a batch's claimed rows all shared one
+lease_until set at claim time (so a slow batch could expire mid-way through
+its own processing, not just on crash), and a crashed worker's downstream
+insert that actually succeeded before it died would be silently reprocessed
+by whoever reclaimed the row. Report §9 attacks 13/14. Fixed here by:
+every entry carries a stable `event_id` (the outbox row's own id) embedded
+into the row payload once at enqueue() time, so every replay attempt of the
+same entry submits the identical idempotency key -- `store.py`'s
+insert_quarantine/insert_trace upsert on it and tolerate "already inserted"
+as success rather than creating a duplicate row. The lease is renewed
+per-entry immediately before it is submitted (not just once for the whole
+claimed batch), and a completion only counts if the affected-row check
+proves this worker still owned the lease at that moment. Every claim AND
+every stale-lease reclaim increments `attempts` (previously only an
+explicit replay failure did), so a worker that repeatedly crashes before
+ever raising still burns down to dead-letter instead of looping forever.
 """
 
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -66,17 +86,31 @@ class Outbox:
     def __init__(self, path=None, max_attempts=DEFAULT_MAX_ATTEMPTS):
         self.path = path or os.environ.get("ASSAYER_OUTBOX", DEFAULT_OUTBOX_PATH)
         self.max_attempts = max_attempts
-        self._conn = None
+        # Sol redteam v4, P0-8: one sqlite3.Connection is not safe to share
+        # across threads without external serialization. Each thread that
+        # touches this Outbox instance gets its own connection to the same
+        # WAL-mode file instead -- SQLite's own file locking (already relied
+        # on by the multi-Outbox-instance concurrency tests) is what
+        # actually serializes conflicting writes, not the Connection object.
+        self._local = threading.local()
         try:
             self._ensure_parent(self.path)
             legacy = self._detach_legacy_jsonl_if_present()
-            self._conn = self._connect()
+            self._local.conn = self._connect()
             self._secure_perms()
             if legacy is not None:
                 legacy_active, legacy_dead = legacy
                 self.migrate_from_jsonl(legacy_active, legacy_dead)
         except (sqlite3.Error, OSError) as exc:
             raise OutboxError(f"failed to open durable outbox at {self.path}: {exc}") from exc
+
+    @property
+    def _conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+        return conn
 
     # ------------------------------------------------------------------
     # Public API
@@ -87,6 +121,16 @@ class Outbox:
         OutboxError if the entry cannot be written at all."""
         entry_id = str(uuid.uuid4())
         now = time.time()
+        # Sol redteam v4, P0-8: event_id is this entry's stable idempotency
+        # key. It never changes across retries/reclaims, so every attempt
+        # to persist this entry submits the identical key -- the target
+        # store's unique constraint on event_id is what actually makes a
+        # duplicate downstream insert (report §9 attacks 13/14) a no-op
+        # instead of a second row. setdefault: a caller that already
+        # assigned its own event_id (e.g. to share identity with a prior
+        # direct-insert attempt) is respected, never overwritten.
+        row = dict(row)
+        row.setdefault("event_id", entry_id)
         try:
             with self._conn:
                 self._conn.execute(
@@ -100,6 +144,13 @@ class Outbox:
         return entry_id
 
     def pending(self):
+        # Self-heal before reading: a "processing" row whose lease already
+        # expired is effectively pending (nobody is actually working it),
+        # but would otherwise stay invisible to pending() -- an operator
+        # asking "what's actionable right now" must not undercount a
+        # crashed worker's abandoned entry just because nobody has called
+        # replay() since it died.
+        self.reclaim_stale_leases()
         return self._read_status("pending")
 
     def dead_letters(self):
@@ -116,11 +167,21 @@ class Outbox:
         worker_id = worker_id or f"pid{os.getpid()}-{uuid.uuid4()}"
         now = time.time()
         self.reclaim_stale_leases(now=now)
-        claimed = self._claim_batch(worker_id, now + lease_seconds, batch_size)
+        claimed, dead_lettered = self._claim_batch(worker_id, now + lease_seconds, batch_size)
 
         replayed = 0
-        dead_lettered = 0
         for entry in claimed:
+            # Sol redteam v4, P0-8: renew this entry's own lease immediately
+            # before submitting it, rather than relying on the single
+            # lease_until the whole batch was claimed with. A batch of many
+            # entries processed serially could otherwise outlive its lease
+            # partway through, letting a concurrent replay() steal and
+            # reprocess an entry this worker is still actively handling. If
+            # the renewal itself finds the lease already gone (rowcount 0),
+            # someone else already has it -- skip rather than risk a
+            # duplicate downstream insert.
+            if not self._renew_lease(entry["id"], worker_id, time.time() + lease_seconds):
+                continue
             try:
                 if entry["table_hint"] == "assayer_quarantine":
                     store.insert_quarantine(entry["row"])
@@ -131,8 +192,17 @@ class Outbox:
                 if status == "dead_letter":
                     dead_lettered += 1
             else:
-                self._complete_success(entry["id"], worker_id)
-                replayed += 1
+                # Sol redteam v4, P0-8: only count this as replayed if the
+                # completion actually affected a row this worker still
+                # owned the lease on. If it didn't (stolen between the
+                # renewal above and this delete -- an extremely tight
+                # window), don't report success for a row we no longer
+                # provably finished: the store-side event_id uniqueness
+                # constraint is what keeps the downstream data itself
+                # correct even in that race; this counter just avoids
+                # double-claiming credit for it.
+                if self._complete_success(entry["id"], worker_id):
+                    replayed += 1
 
         still_pending = self._count_status("pending")
         return replayed, still_pending, dead_lettered
@@ -140,14 +210,21 @@ class Outbox:
     def reclaim_stale_leases(self, now=None):
         """Return any entry whose lease has expired (its worker crashed,
         was killed, or hung) back to pending so another replay() can claim
-        it. Safe to call at any time, including concurrently."""
+        it -- or straight to dead_letter if this stale lease is itself the
+        entry's max_attempts'th attempt (Sol redteam v4, P0-8: a worker that
+        crashes on every single claim, before ever raising an explicit
+        failure, must still burn down to dead-letter instead of being
+        reclaimed forever). Safe to call at any time, including
+        concurrently."""
         now = time.time() if now is None else now
         with self._conn:
             self._conn.execute(
                 """UPDATE outbox_entries
-                   SET status='pending', lease_owner=NULL, lease_until=NULL, updated_at=?
+                   SET status=CASE WHEN attempts >= ? THEN 'dead_letter' ELSE 'pending' END,
+                       last_error=CASE WHEN attempts >= ? THEN 'lease expired (stale worker)' ELSE last_error END,
+                       lease_owner=NULL, lease_until=NULL, updated_at=?
                    WHERE status='processing' AND lease_until IS NOT NULL AND lease_until < ?""",
-                (now, now),
+                (self.max_attempts, self.max_attempts, now, now),
             )
 
     def migrate_from_jsonl(self, jsonl_path, deadletter_path=None):
@@ -167,7 +244,11 @@ class Outbox:
     # ------------------------------------------------------------------
 
     def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
+        # check_same_thread=True (the sqlite3 default): each thread now gets
+        # its own Connection via the _conn property, so nothing should ever
+        # reuse this object cross-thread -- if something does, a loud
+        # ProgrammingError beats silent corruption.
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -183,7 +264,13 @@ class Outbox:
     def _ensure_parent(self, path):
         parent = os.path.dirname(path)
         if parent:
+            # Sol redteam v4, P0-8: os.makedirs' mode is masked by the
+            # process umask, so the actual resulting permissions are
+            # whatever the caller's environment happens to have set --
+            # quarantine evidence's parent directory should not depend on
+            # that. chmod explicitly rather than trusting umask.
             os.makedirs(parent, exist_ok=True)
+            os.chmod(parent, 0o700)
 
     def _is_sqlite_file(self, path):
         try:
@@ -256,11 +343,18 @@ class Outbox:
         return 1
 
     def _claim_batch(self, worker_id, lease_until_ts, batch_size):
+        # Sol redteam v4, P0-8: attempts increments here, on every claim --
+        # not only on an explicit replay failure. A worker that crashes
+        # before ever reaching the try/except in replay() (e.g. dies right
+        # after being claimed) still burns down toward max_attempts via
+        # reclaim_stale_leases' dead-letter check, instead of being reclaimed
+        # and reprocessed forever.
         now = time.time()
         with self._conn:
             rows = self._conn.execute(
                 """UPDATE outbox_entries
-                   SET status='processing', lease_owner=?, lease_until=?, updated_at=?
+                   SET status='processing', lease_owner=?, lease_until=?,
+                       attempts=attempts+1, updated_at=?
                    WHERE id IN (
                        SELECT id FROM outbox_entries
                        WHERE status='pending'
@@ -270,29 +364,68 @@ class Outbox:
                    RETURNING id, table_hint, payload, attempts""",
                 (worker_id, lease_until_ts, now, batch_size),
             ).fetchall()
-        return [
-            {"id": r[0], "table_hint": r[1], "row": json.loads(r[2]), "attempts": r[3]}
-            for r in rows
-        ]
+
+        claimed = []
+        unparseable = 0
+        for r in rows:
+            entry_id, table_hint, payload, attempts = r[0], r[1], r[2], r[3]
+            try:
+                row = json.loads(payload)
+            except (ValueError, TypeError) as exc:
+                # Sol redteam v4, P0-8: a malformed payload must not poison
+                # the whole claimed batch -- it will never parse
+                # successfully on retry, so dead-letter this one entry
+                # immediately and keep going with the rest of the batch.
+                self._dead_letter_unparseable(entry_id, worker_id, str(exc))
+                unparseable += 1
+                continue
+            claimed.append({"id": entry_id, "table_hint": table_hint, "row": row, "attempts": attempts})
+        return claimed, unparseable
+
+    def _dead_letter_unparseable(self, entry_id, worker_id, error):
+        with self._conn:
+            self._conn.execute(
+                """UPDATE outbox_entries
+                   SET status='dead_letter', lease_owner=NULL, lease_until=NULL,
+                       last_error=?, updated_at=?
+                   WHERE id=? AND lease_owner=?""",
+                (f"unparseable payload: {error}", time.time(), entry_id, worker_id),
+            )
+
+    def _renew_lease(self, entry_id, worker_id, lease_until_ts):
+        with self._conn:
+            cur = self._conn.execute(
+                """UPDATE outbox_entries SET lease_until=?, updated_at=?
+                   WHERE id=? AND lease_owner=? AND status='processing'""",
+                (lease_until_ts, time.time(), entry_id, worker_id),
+            )
+        return cur.rowcount > 0
 
     def _complete_success(self, entry_id, worker_id):
         with self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "DELETE FROM outbox_entries WHERE id=? AND lease_owner=?",
                 (entry_id, worker_id),
             )
+        # Sol redteam v4, P0-8: never report success on an update that
+        # affected zero rows -- rowcount 0 means the lease was already lost
+        # (stolen/reclaimed) before this delete landed, so this worker
+        # cannot prove it was the one that actually finished the row.
+        return cur.rowcount > 0
 
     def _complete_failure(self, entry_id, worker_id, attempts, error):
-        new_attempts = attempts + 1
-        status = "dead_letter" if new_attempts >= self.max_attempts else "pending"
+        # attempts was already incremented once by _claim_batch for this
+        # very attempt -- do not increment again here, or one attempt would
+        # count twice.
+        status = "dead_letter" if attempts >= self.max_attempts else "pending"
         now = time.time()
         with self._conn:
             self._conn.execute(
                 """UPDATE outbox_entries
-                   SET status=?, attempts=?, lease_owner=NULL, lease_until=NULL,
+                   SET status=?, lease_owner=NULL, lease_until=NULL,
                        last_error=?, updated_at=?
                    WHERE id=? AND lease_owner=?""",
-                (status, new_attempts, error, now, entry_id, worker_id),
+                (status, error, now, entry_id, worker_id),
             )
         return status
 
@@ -304,18 +437,28 @@ class Outbox:
 
     def _read_status(self, status):
         rows = self._conn.execute(
-            """SELECT id, table_hint, payload, attempts, status, created_at
+            """SELECT id, table_hint, payload, attempts, status, created_at, last_error
                FROM outbox_entries WHERE status=? ORDER BY created_at""",
             (status,),
         ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "table_hint": r[1],
-                "row": json.loads(r[2]),
-                "attempts": r[3],
-                "status": r[4],
-                "queued_at": r[5],
-            }
-            for r in rows
-        ]
+        entries = []
+        for r in rows:
+            try:
+                row = json.loads(r[2])
+            except (ValueError, TypeError):
+                # A malformed payload must not poison listing either (Sol
+                # redteam v4, P0-8) -- surface it as an opaque raw string
+                # rather than raising out of pending()/dead_letters().
+                row = {"_unparseable_raw_payload": r[2]}
+            entries.append(
+                {
+                    "id": r[0],
+                    "table_hint": r[1],
+                    "row": row,
+                    "attempts": r[3],
+                    "status": r[4],
+                    "queued_at": r[5],
+                    "last_error": r[6],
+                }
+            )
+        return entries

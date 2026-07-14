@@ -23,6 +23,9 @@ class FakeStore:
     def insert_trace(self, row):
         if self.raise_on_insert_trace:
             raise RuntimeError("insert_trace failed")
+        event_id = row.get("event_id")
+        if event_id and any(r.get("event_id") == event_id for r in self.traces):
+            return row  # already inserted: tolerate, do not duplicate
         self.traces.append(row)
         if row.get("verdict") == "pass":
             self._passed_hashes.add((row["pipeline"], row["item_hash"]))
@@ -31,12 +34,21 @@ class FakeStore:
     def insert_quarantine(self, row):
         if self.raise_on_insert_quarantine:
             raise RuntimeError("insert_quarantine failed")
+        event_id = row.get("event_id")
+        if event_id:
+            existing = next((r for r in self.quarantine if r.get("event_id") == event_id), None)
+            if existing is not None:
+                return existing["id"]  # already inserted: tolerate, do not duplicate
         qid = self._next_id
         self._next_id += 1
         row_copy = dict(row)
         row_copy["id"] = qid
         self.quarantine.append(row_copy)
         return qid
+
+    def delete_quarantine(self, ids):
+        ids = set(ids)
+        self.quarantine = [r for r in self.quarantine if r.get("id") not in ids]
 
     def seen_pass(self, pipeline, item_hash):
         if self.raise_on_seen_pass:
