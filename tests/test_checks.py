@@ -274,9 +274,116 @@ class DomainValidatorCheckTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("no language declared", detail)
 
+    def test_pass_on_valid_json(self):
+        check = checks.domain_validator()
+        ok, _ = check({"language": "json", "content": '{"a": 1}'})
+        self.assertTrue(ok)
+
+    def test_fail_on_invalid_json(self):
+        check = checks.domain_validator()
+        ok, detail = check({"language": "json", "content": "{not json"})
+        self.assertFalse(ok)
+        self.assertIn("valid json", detail)
+
     def test_name(self):
         check = checks.domain_validator()
         self.assertEqual(check.name, "domain_validator")
+
+
+class DomainValidatorRequireValidatorTests(unittest.TestCase):
+    """Sol redteam v4, P1-12: the strict/blocking coding profile must fail
+    a recognized language with no installed validator, not pass it."""
+
+    def test_fail_when_language_unregistered_and_required(self):
+        check = checks.domain_validator(require_validator=True)
+        ok, detail = check({"language": "markdown", "content": "anything"})
+        self.assertFalse(ok)
+        self.assertIn("no domain validator installed", detail)
+
+    def test_still_dispatches_to_registered_validator(self):
+        check = checks.domain_validator(require_validator=True)
+        ok, _ = check({"language": "python", "content": "def f():\n    return 1\n"})
+        self.assertTrue(ok)
+
+    def test_still_passes_when_language_missing(self):
+        # require_validator only applies once a language IS declared --
+        # a missing declaration is required_fields'/language_allowlist's
+        # concern, not this check's.
+        check = checks.domain_validator(require_validator=True)
+        ok, _ = check({"content": "anything"})
+        self.assertTrue(ok)
+
+
+class LanguageAllowlistCheckTests(unittest.TestCase):
+    def test_pass_for_allowed_language(self):
+        check = checks.language_allowlist(allowed_languages=["python", "markdown"])
+        ok, _ = check({"language": "python"})
+        self.assertTrue(ok)
+
+    def test_pass_case_insensitive(self):
+        check = checks.language_allowlist(allowed_languages=["python"])
+        ok, _ = check({"language": "Python"})
+        self.assertTrue(ok)
+
+    def test_fail_for_fabricated_language_sol_attack_16(self):
+        check = checks.language_allowlist(allowed_languages=["python", "markdown"])
+        ok, detail = check({"language": "madeup"})
+        self.assertFalse(ok)
+        self.assertIn("madeup", detail)
+
+    def test_on_unknown_pass_mode(self):
+        check = checks.language_allowlist(allowed_languages=["python"], on_unknown="pass")
+        ok, detail = check({"language": "madeup"})
+        self.assertTrue(ok)
+        self.assertIn("not in allowlist", detail)
+
+    def test_fail_when_language_missing(self):
+        check = checks.language_allowlist(allowed_languages=["python"])
+        ok, _ = check({})
+        self.assertFalse(ok)
+
+    def test_name(self):
+        check = checks.language_allowlist()
+        self.assertEqual(check.name, "language_allowlist:language")
+
+
+class MediaTypeConsistencyCheckTests(unittest.TestCase):
+    def test_pass_when_media_type_matches_language(self):
+        check = checks.media_type_consistency()
+        ok, _ = check({"language": "python", "artifact_media_type": "text/x-python"})
+        self.assertTrue(ok)
+
+    def test_pass_when_media_type_absent(self):
+        check = checks.media_type_consistency()
+        ok, detail = check({"language": "python"})
+        self.assertTrue(ok)
+        self.assertIn("nothing to check", detail)
+
+    def test_pass_when_media_type_blank(self):
+        check = checks.media_type_consistency()
+        ok, _ = check({"language": "python", "artifact_media_type": ""})
+        self.assertTrue(ok)
+
+    def test_fail_when_media_type_mismatches_language(self):
+        check = checks.media_type_consistency()
+        ok, detail = check({"language": "python", "artifact_media_type": "application/json"})
+        self.assertFalse(ok)
+        self.assertIn("python", detail)
+
+    def test_pass_when_language_unregistered_deterministic(self):
+        check = checks.media_type_consistency()
+        ok, detail = check({"language": "cobol", "artifact_media_type": "text/x-cobol"})
+        self.assertTrue(ok)
+        self.assertIn("no known media types", detail)
+
+    def test_fail_when_language_missing(self):
+        check = checks.media_type_consistency()
+        ok, _ = check({"artifact_media_type": "text/x-python"})
+        self.assertFalse(ok)
+
+    def test_name(self):
+        check = checks.media_type_consistency()
+        self.assertEqual(check.name, "media_type_consistency")
 
 
 class DedupCheckTests(unittest.TestCase):

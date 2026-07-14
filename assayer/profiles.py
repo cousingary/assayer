@@ -44,7 +44,16 @@ CODING_OUTPUT_V2_REQUIRED_FIELDS = {"content": str, "language": str}
 PROFILES = {
     "coding-output-v1": {
         "version": "1.0.0",
-        "enforcement": "blocking",
+        # Sol redteam v4, P1-12: v1 predates any language declaration at
+        # all, so it has no way to reject a fabricated/unvalidated language
+        # the way v2 now does (language_allowlist / domain_validator with
+        # require_validator=True below). Deprecated for blocking production
+        # use: downgraded from "blocking" to "advisory" so it can no longer
+        # gate a real release, only record telemetry. Callers that need a
+        # blocking gate must move to coding-output-v2.
+        "enforcement": "advisory",
+        "deprecated": True,
+        "deprecated_reason": "no language declaration/validation; use coding-output-v2 for blocking gates",
         "on_fail": "quarantine",
         "on_error": "quarantine",
         "checks": [
@@ -68,7 +77,17 @@ PROFILES = {
         ],
     },
     "coding-output-v2": {
-        "version": "2.1.0",
+        # 2.2.0 (Sol redteam v4, P1-12 / report §9 attack 16): a fabricated
+        # language (e.g. "madeup") used to pass outright -- file_path_consistency
+        # and domain_validator both treat "nothing registered for this
+        # language" as a deterministic pass. This is the strict/blocking
+        # coding profile now: language_allowlist rejects any language this
+        # module doesn't actually recognize, domain_validator's
+        # require_validator=True rejects a *recognized* language that still
+        # has no installed validator (currently: python, json), and
+        # media_type_consistency cross-checks the envelope's declared media
+        # type against the payload's declared language.
+        "version": "2.2.0",
         "enforcement": "blocking",
         "on_fail": "quarantine",
         "on_error": "quarantine",
@@ -94,7 +113,15 @@ PROFILES = {
             # a logical handle (e.g. "code") and was never guaranteed to
             # carry a real file extension.
             {"kind": "file_path_consistency", "args": {"name_field": "artifact_declared_path"}},
-            {"kind": "domain_validator", "args": {}},
+            {
+                "kind": "language_allowlist",
+                "args": {
+                    "allowed_languages": sorted(checks_mod.LANGUAGE_EXTENSIONS),
+                    "on_unknown": "fail",
+                },
+            },
+            {"kind": "media_type_consistency", "args": {}},
+            {"kind": "domain_validator", "args": {"require_validator": True}},
         ],
     },
 }
@@ -155,11 +182,28 @@ def _build_check(spec):
         resolved_args = {"field": field, "name_field": name_field}
     elif kind == "domain_validator":
         field = args.get("field", "language")
-        base = checks_mod.domain_validator(field)
+        require_validator = args.get("require_validator", False)
+        base = checks_mod.domain_validator(field, require_validator=require_validator)
         resolved_args = {
             "field": field,
+            "require_validator": require_validator,
             "registered_domains": sorted(checks_mod.DOMAIN_VALIDATORS),
         }
+    elif kind == "language_allowlist":
+        field = args.get("field", "language")
+        on_unknown = args.get("on_unknown", "fail")
+        allowed_languages = tuple(args["allowed_languages"])
+        base = checks_mod.language_allowlist(field, allowed_languages, on_unknown=on_unknown)
+        resolved_args = {
+            "field": field,
+            "on_unknown": on_unknown,
+            "allowed_languages": sorted(allowed_languages),
+        }
+    elif kind == "media_type_consistency":
+        field = args.get("field", "language")
+        media_field = args.get("media_field", "artifact_media_type")
+        base = checks_mod.media_type_consistency(field, media_field)
+        resolved_args = {"field": field, "media_field": media_field}
     else:
         raise ValueError(f"unknown check kind: {kind}")
 

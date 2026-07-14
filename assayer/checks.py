@@ -5,6 +5,7 @@ All checks are pure (no I/O) except `dedup`, which talks to a store.
 """
 
 import ast
+import json
 import re
 
 # TUNABLE
@@ -214,6 +215,76 @@ LANGUAGE_EXTENSIONS = {
 }
 
 
+def language_allowlist(field="language", allowed_languages=(), on_unknown="fail"):
+    """Sol audit finding #16 ("fabricated languages"): file_path_consistency
+    and domain_validator both pass deterministically for a language they
+    have nothing registered for, which lets a made-up value like "madeup"
+    sail through untouched. This check is the one that actually says a
+    declared language must be a real, recognized value -- `on_unknown`
+    controls whether an unrecognized value fails (a strict/blocking
+    profile) or merely passes with a note (a permissive profile that
+    hasn't enumerated every real language yet)."""
+    allowed = {lang.lower() for lang in allowed_languages}
+
+    def fn(item):
+        value = item.get(field)
+        if not isinstance(value, str) or not value:
+            return False, f"{field} missing or not a string"
+        if value.lower() not in allowed:
+            if on_unknown == "fail":
+                return False, f"{field} {value!r} is not a recognized/allowed language"
+            return True, f"{field} {value!r} not in allowlist (on_unknown={on_unknown!r})"
+        return True, "ok"
+
+    return Check(f"language_allowlist:{field}", fn)
+
+
+# TUNABLE: media types each declared `language` value is expected to carry
+# on the artifact envelope. Same deterministic-pass-when-unregistered shape
+# as LANGUAGE_EXTENSIONS -- a language with nothing registered here is not
+# this check's gap, language_allowlist's job is to reject it outright.
+LANGUAGE_MEDIA_TYPES = {
+    "python": ("text/x-python", "application/x-python"),
+    "javascript": ("text/javascript", "application/javascript"),
+    "typescript": ("text/typescript", "application/typescript"),
+    "go": ("text/x-go",),
+    "markdown": ("text/markdown",),
+    "json": ("application/json",),
+    "yaml": ("text/yaml", "application/x-yaml", "application/yaml"),
+    "shell": ("text/x-sh", "application/x-sh"),
+}
+
+
+def media_type_consistency(field="language", media_field="artifact_media_type"):
+    """The envelope's declared `media_field` (e.g. "artifact_media_type")
+    must be consistent with `field` (e.g. "language"), for any language this
+    module has a known media-type set for. A missing/blank media type is
+    not a gap this check reports on -- it just means there is nothing to
+    verify consistency against."""
+
+    def fn(item):
+        language = item.get(field)
+        if not isinstance(language, str) or not language:
+            return False, f"{field} missing or not a string"
+
+        media_type = item.get(media_field)
+        if not isinstance(media_type, str) or not media_type:
+            return True, f"no {media_field} declared, nothing to check consistency against"
+
+        allowed = LANGUAGE_MEDIA_TYPES.get(language.lower())
+        if allowed is None:
+            return True, f"no known media types registered for language {language!r}"
+
+        if media_type.lower() not in allowed:
+            return False, (
+                f"{media_field} {media_type!r} does not match declared "
+                f"{field} {language!r} (expected one of {allowed})"
+            )
+        return True, "ok"
+
+    return Check("media_type_consistency", fn)
+
+
 def file_path_consistency(field="language", name_field="artifact_name"):
     """The artifact's declared `field` (e.g. "language") must be consistent
     with the file extension on `name_field` (e.g. "artifact_name"), for any
@@ -255,19 +326,39 @@ def _validate_python_source(item):
     return True, "ok"
 
 
+def _validate_json_source(item):
+    source = item.get("content", "")
+    if not isinstance(source, str):
+        return False, "content is not a string"
+    try:
+        json.loads(source)
+    except ValueError as exc:
+        return False, f"content is not syntactically valid json: {exc}"
+    return True, "ok"
+
+
 # Registry of per-language domain validators: language (lowercased) ->
-# fn(item) -> (ok, detail). Open for extension by callers/future profiles;
-# a language with no registered validator deterministically passes (no
-# domain-specific structure to check yet is not the same as failing).
+# fn(item) -> (ok, detail). Open for extension by callers/future profiles.
+# Whether an unregistered language deterministically passes or fails is
+# `domain_validator`'s `require_validator` flag's call, not this registry's --
+# see Sol audit finding #12/#16: a permissive profile can still treat "no
+# validator installed yet" as a pass, but the strict/blocking coding profile
+# must not.
 DOMAIN_VALIDATORS = {
     "python": _validate_python_source,
+    "json": _validate_json_source,
 }
 
 
-def domain_validator(field="language"):
+def domain_validator(field="language", require_validator=False):
     """Dispatches to DOMAIN_VALIDATORS[item[field]] when a validator is
-    registered for the declared language; otherwise passes deterministically
-    (nothing registered to check against)."""
+    registered for the declared language. When no validator is registered:
+    `require_validator=False` (default) passes deterministically (nothing
+    registered to check against yet is not the same as failing -- the
+    permissive/telemetry case). `require_validator=True` fails instead --
+    the strict/blocking case, where "no domain-specific validation exists
+    for this declared language" must not be indistinguishable from "this
+    content is fine"."""
 
     def fn(item):
         language = item.get(field)
@@ -276,6 +367,11 @@ def domain_validator(field="language"):
 
         validator = DOMAIN_VALIDATORS.get(language.lower())
         if validator is None:
+            if require_validator:
+                return False, (
+                    f"no domain validator installed for {field} {language!r} "
+                    f"(required by this profile)"
+                )
             return True, f"no domain validator registered for {field} {language!r}"
         return validator(item)
 

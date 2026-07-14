@@ -82,8 +82,11 @@ class EvaluateCLITests(unittest.TestCase):
         )
 
     def test_fail_verdict_missing_required_field(self):
+        # coding-output-v1 is advisory-only since P1-12's deprecation (it can
+        # never produce "fail") -- use v2 (still blocking) to exercise the
+        # generic required_fields-missing behavior this test is about.
         req = base_request(payload={})
-        proc = run_evaluate(req)
+        proc = run_evaluate(req, profile="coding-output-v2")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "fail")
@@ -129,8 +132,10 @@ class EvaluateCLITests(unittest.TestCase):
         self.assertNotEqual(v1["evaluation_id"], v2["evaluation_id"])
 
     def test_placeholder_content_fails_no_placeholders_check(self):
+        # v1 is advisory-only (see test_fail_verdict_missing_required_field);
+        # use v2 to keep this a blocking-fail assertion.
         req = base_request(payload={"content": "TODO: fill this in with real content [placeholder]"})
-        proc = run_evaluate(req)
+        proc = run_evaluate(req, profile="coding-output-v2")
         verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "fail")
         self.assertIn("no_placeholder:content", verdict["failed_checks"])
@@ -138,7 +143,7 @@ class EvaluateCLITests(unittest.TestCase):
     def test_missing_artifact_envelope_fields_fail_artifact_schema(self):
         req = base_request()
         del req["artifact_name"]
-        proc = run_evaluate(req)
+        proc = run_evaluate(req, profile="coding-output-v2")
         verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "fail")
         self.assertIn("artifact_schema", verdict["failed_checks"])
@@ -221,7 +226,16 @@ class EvaluateCLITests(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "fail")
         self.assertIn("domain_validator", verdict["failed_checks"])
 
-    def test_v2_passes_unregistered_language_domain_validator(self):
+    def test_v2_fails_recognized_language_with_no_installed_validator(self):
+        # Sol redteam v4, P1-12: v2.2.0 requires an *installed* domain
+        # validator for a blocking pass, not merely a recognized language.
+        # "markdown" is a real, allowlisted language (file_path_consistency
+        # and language_allowlist both accept it) but has no domain validator
+        # registered -- domain_validator(require_validator=True) must fail
+        # it rather than silently passing. This replaces the old
+        # test_v2_passes_unregistered_language_domain_validator, whose
+        # premise (unvalidated == fine) is exactly the gap this session
+        # closes.
         req = base_request(
             payload={
                 "content": "This is a sufficiently long piece of real generated markdown content.",
@@ -233,7 +247,87 @@ class EvaluateCLITests(unittest.TestCase):
         )
         proc = run_evaluate(req, profile="coding-output-v2")
         verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail", verdict)
+        self.assertIn("domain_validator", verdict["failed_checks"])
+        self.assertNotIn("language_allowlist:language", verdict["failed_checks"])
+        self.assertNotIn("file_path_consistency", verdict["failed_checks"])
+
+    def test_v2_fails_json_with_no_installed_validator_is_actually_installed(self):
+        # json IS registered (checks._validate_json_source) -- valid JSON
+        # content must pass domain_validator even under require_validator=True.
+        req = base_request(
+            payload={"content": '{"a": 1, "b": "padding text so content clears the minimum length"}', "language": "json"},
+            check_profile="coding-output-v2",
+            artifact_name="code",
+            artifact_declared_path="output.json",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "pass", verdict)
+
+    def test_v2_rejects_fabricated_language_sol_attack_16(self):
+        # Report §9 attack 16: a coding-output artifact declaring a
+        # fabricated language ("madeup") used to pass v2 outright, because
+        # file_path_consistency/domain_validator both treated "nothing
+        # registered for this language" as a deterministic pass.
+        # language_allowlist now rejects it explicitly.
+        req = base_request(
+            payload={
+                "content": "This is sufficiently long content in a made-up language.",
+                "language": "madeup",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="code",
+            artifact_declared_path="output.madeup",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail", verdict)
+        self.assertIn("language_allowlist:language", verdict["failed_checks"])
+
+    def test_v2_fails_on_media_type_language_mismatch(self):
+        req = base_request(
+            payload={
+                "content": "def add(a, b):\n    return a + b\n",
+                "language": "python",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="code",
+            artifact_declared_path="output.py",
+            artifact_media_type="application/json",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "fail", verdict)
+        self.assertIn("media_type_consistency", verdict["failed_checks"])
+
+    def test_v2_passes_matching_media_type(self):
+        req = base_request(
+            payload={
+                "content": "def add(a, b):\n    return a + b\n",
+                "language": "python",
+            },
+            check_profile="coding-output-v2",
+            artifact_name="code",
+            artifact_declared_path="output.py",
+            artifact_media_type="text/x-python",
+        )
+        proc = run_evaluate(req, profile="coding-output-v2")
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
+
+    def test_v1_fabricated_language_no_longer_blocks_release(self):
+        # v1 has no language checks at all and is now advisory-only: a
+        # verdict of "fail" must never be produced by a deprecated advisory
+        # profile, since verify_scored() maps failed checks to "advisory"
+        # (never "fail") under non-blocking enforcement.
+        req = base_request(
+            payload={"content": "This is sufficiently long placeholder-free real content."},
+        )
+        proc = run_evaluate(req, profile="coding-output-v1")
+        verdict = json.loads(proc.stdout)
+        self.assertIn(verdict["verdict"], ("pass", "advisory"))
+        self.assertNotEqual(verdict["verdict"], "fail")
 
     def test_protocol_version_mismatch_fails_closed(self):
         # Sol audit P1.7: a mismatched artifact protocol_version (a stale
