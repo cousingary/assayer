@@ -55,6 +55,8 @@ DEFAULT_MAX_ATTEMPTS = 5
 # TUNABLE: how long a claimed entry is leased to one worker before another
 # worker's stale-lease recovery is allowed to reclaim it.
 DEFAULT_LEASE_SECONDS = 60
+KNOWN_TABLE_HINTS = {"assayer_quarantine", "assayer_traces"}
+UNKNOWN_OUTBOX_OPERATION = "UNKNOWN_OUTBOX_OPERATION"
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -171,22 +173,21 @@ class Outbox:
 
         replayed = 0
         for entry in claimed:
-            # Sol redteam v4, P0-8: renew this entry's own lease immediately
-            # before submitting it, rather than relying on the single
-            # lease_until the whole batch was claimed with. A batch of many
-            # entries processed serially could otherwise outlive its lease
-            # partway through, letting a concurrent replay() steal and
-            # reprocess an entry this worker is still actively handling. If
-            # the renewal itself finds the lease already gone (rowcount 0),
-            # someone else already has it -- skip rather than risk a
-            # duplicate downstream insert.
+            if entry["table_hint"] not in KNOWN_TABLE_HINTS:
+                if self._dead_letter_unknown_operation(entry["id"], worker_id, entry["table_hint"]):
+                    dead_lettered += 1
+                continue
+
             if not self._renew_lease(entry["id"], worker_id, time.time() + lease_seconds):
                 continue
+            heartbeat = self._start_lease_heartbeat(entry["id"], worker_id, lease_seconds)
             try:
                 if entry["table_hint"] == "assayer_quarantine":
                     store.insert_quarantine(entry["row"])
-                else:
+                elif entry["table_hint"] == "assayer_traces":
                     store.insert_trace(entry["row"])
+                else:
+                    raise RuntimeError(f"{UNKNOWN_OUTBOX_OPERATION}: {entry['table_hint']}")
             except Exception as exc:
                 status = self._complete_failure(entry["id"], worker_id, entry["attempts"], str(exc))
                 if status == "dead_letter":
@@ -203,6 +204,8 @@ class Outbox:
                 # double-claiming credit for it.
                 if self._complete_success(entry["id"], worker_id):
                     replayed += 1
+            finally:
+                heartbeat.stop()
 
         still_pending = self._count_status("pending")
         return replayed, still_pending, dead_lettered
@@ -391,6 +394,47 @@ class Outbox:
                    WHERE id=? AND lease_owner=?""",
                 (f"unparseable payload: {error}", time.time(), entry_id, worker_id),
             )
+
+    def _start_lease_heartbeat(self, entry_id, worker_id, lease_seconds):
+        """Renew a processing lease for the full downstream call.
+
+        S9/P1-4: a single pre-call renewal is not sufficient when a target
+        operation outlives the lease. The heartbeat prevents another worker
+        from reclaiming and executing the same outbox operation mid-call.
+        """
+
+        class Heartbeat:
+            def __init__(self, outer):
+                self._outer = outer
+                self._stop = threading.Event()
+                self.lost = threading.Event()
+                self._interval = max(0.05, min(lease_seconds / 3.0, 5.0))
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+
+            def _run(self):
+                while not self._stop.wait(self._interval):
+                    ok = self._outer._renew_lease(entry_id, worker_id, time.time() + lease_seconds)
+                    if not ok:
+                        self.lost.set()
+                        return
+
+            def stop(self):
+                self._stop.set()
+                self._thread.join(timeout=max(1.0, self._interval * 2))
+
+        return Heartbeat(self)
+
+    def _dead_letter_unknown_operation(self, entry_id, worker_id, table_hint):
+        with self._conn:
+            cur = self._conn.execute(
+                """UPDATE outbox_entries
+                   SET status='dead_letter', lease_owner=NULL, lease_until=NULL,
+                       last_error=?, updated_at=?
+                   WHERE id=? AND lease_owner=? AND status='processing'""",
+                (f"{UNKNOWN_OUTBOX_OPERATION}: {table_hint}", time.time(), entry_id, worker_id),
+            )
+        return cur.rowcount > 0
 
     def _renew_lease(self, entry_id, worker_id, lease_until_ts):
         with self._conn:

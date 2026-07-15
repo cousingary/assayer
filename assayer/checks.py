@@ -378,13 +378,20 @@ def domain_validator(field="language", require_validator=False):
     return Check("domain_validator", fn)
 
 
-def dedup(store, pipeline, hash_getter):
+def dedup(store, pipeline, hash_getter, failure_policy="advisory"):
+    if failure_policy not in ("fail", "advisory", "skip"):
+        raise ValueError("dedup failure_policy must be one of: fail, advisory, skip")
+
     def fn(item):
         h = hash_getter(item)
         try:
             seen = store.seen_pass(pipeline, h)
-        except Exception:
-            return True, "dedup skipped: store unavailable"
+        except Exception as exc:
+            if failure_policy == "fail":
+                return False, f"dedup store unavailable: {exc}"
+            if failure_policy == "skip":
+                return True, "dedup skipped by profile policy"
+            return True, f"dedup advisory: store unavailable: {exc}"
 
         if seen:
             return False, f"duplicate of previously passed item {h[:8]}"

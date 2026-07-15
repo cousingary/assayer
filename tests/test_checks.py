@@ -401,12 +401,26 @@ class DedupCheckTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("abc123"[:8], detail)
 
-    def test_fail_open_when_store_raises(self):
+    def test_advisory_when_store_raises_by_default(self):
         store = FakeStore(raise_on_seen_pass=True)
         check = checks.dedup(store, "mypipeline", lambda item: item["hash"])
         ok, detail = check({"hash": "abc123"})
         self.assertTrue(ok)
         self.assertIn("unavailable", detail)
+
+    def test_blocking_profile_can_fail_closed_when_store_raises(self):
+        store = FakeStore(raise_on_seen_pass=True)
+        check = checks.dedup(store, "mypipeline", lambda item: item["hash"], failure_policy="fail")
+        ok, detail = check({"hash": "abc123"})
+        self.assertFalse(ok)
+        self.assertIn("dedup store unavailable", detail)
+
+    def test_skip_policy_is_explicit(self):
+        store = FakeStore(raise_on_seen_pass=True)
+        check = checks.dedup(store, "mypipeline", lambda item: item["hash"], failure_policy="skip")
+        ok, detail = check({"hash": "abc123"})
+        self.assertTrue(ok)
+        self.assertIn("skipped by profile policy", detail)
 
     def test_name(self):
         store = FakeStore()

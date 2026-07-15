@@ -84,6 +84,25 @@ class Store:
             return
         self.client.table("assayer_quarantine").delete().in_("id", list(ids)).execute()
 
+    def delete_expired_quarantine(self, statuses, cutoff_iso):
+        """Atomically delete only rows that still match retention criteria.
+
+        P1-7: callers must not select rows by status/age and then later
+        delete by id only, because a row can be reopened or updated between
+        selection and deletion. Supabase's REST API cannot express
+        `DELETE ... RETURNING id` directly here, so constrain the delete
+        itself by status and timestamp and request returned rows from the
+        API result when available.
+        """
+        result = (
+            self.client.table("assayer_quarantine")
+            .delete()
+            .in_("status", list(statuses))
+            .lt("ts", cutoff_iso)
+            .execute()
+        )
+        return [row.get("id") for row in (result.data or []) if row.get("id") is not None]
+
     def seen_pass(self, pipeline, item_hash) -> bool:
         result = (
             self.client.table("assayer_traces")

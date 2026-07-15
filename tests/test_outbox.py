@@ -249,7 +249,8 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
             outbox = Outbox(path=path)
             outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
 
-            proc = multiprocessing.Process(target=_claim_lease_then_sigkill, args=(path, 1))
+            ctx = multiprocessing.get_context("spawn")
+            proc = ctx.Process(target=_claim_lease_then_sigkill, args=(path, 1))
             proc.start()
             proc.join(timeout=10)
             self.assertEqual(proc.exitcode, -signal.SIGKILL, "child must have been hard-killed")
@@ -263,6 +264,92 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
             replayed, still_pending, dead_lettered = outbox.replay(store)
             self.assertEqual(replayed, 1)
             self.assertEqual(store.quarantine[0]["pipeline"], "p")
+
+    def _tmp(self):
+        import tempfile
+
+        return tempfile.TemporaryDirectory()
+
+
+class SlowNonIdempotentStore:
+    """Downstream target that records every attempted execution.
+
+    Unlike FakeStore, this deliberately does not deduplicate by event_id:
+    corpus case 31 is about preventing duplicate downstream execution while
+    the first call is still in flight, not merely suppressing duplicate rows
+    in a friendly target table.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def insert_quarantine(self, row):
+        with self._lock:
+            self.calls.append(dict(row))
+            first = len(self.calls) == 1
+        if first:
+            self.entered.set()
+            self.release.wait(timeout=5)
+        return len(self.calls)
+
+    def insert_trace(self, row):
+        with self._lock:
+            self.calls.append(dict(row))
+        return row
+
+
+class Sol6OutboxLeaseHeartbeatTests(unittest.TestCase):
+    def test_attack31_lease_renewed_through_slow_downstream_call_prevents_duplicate_execution(self):
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            outbox.enqueue("assayer_quarantine", {"pipeline": "p"})
+            store = SlowNonIdempotentStore()
+            result = {}
+
+            def worker_a():
+                result["a"] = outbox.replay(store, lease_seconds=0.2)
+
+            ta = threading.Thread(target=worker_a)
+            ta.start()
+            self.assertTrue(store.entered.wait(timeout=5), "worker a never entered slow insert")
+            time.sleep(0.55)  # longer than the original lease; heartbeat must keep ownership alive
+
+            outbox_b = Outbox(path=path)
+            replayed_b, still_pending_b, dead_b = outbox_b.replay(store, lease_seconds=0.2)
+
+            store.release.set()
+            ta.join(timeout=5)
+
+            self.assertEqual(len(store.calls), 1, "second worker must not execute a leased slow op")
+            self.assertEqual((replayed_b, still_pending_b, dead_b), (0, 0, 0))
+            self.assertEqual(result["a"][0], 1)
+
+    def _tmp(self):
+        import tempfile
+
+        return tempfile.TemporaryDirectory()
+
+
+class Sol6OutboxUnknownOperationTests(unittest.TestCase):
+    def test_attack32_unknown_table_hint_is_dead_lettered_not_reinterpreted_as_trace(self):
+        with self._tmp() as tmp:
+            path = str(Path(tmp) / "outbox.db")
+            outbox = Outbox(path=path)
+            outbox.enqueue("assayer_quaratnine_typo", {"pipeline": "p"})
+            store = FakeStore()
+
+            replayed, still_pending, dead_lettered = outbox.replay(store)
+
+            self.assertEqual((replayed, still_pending, dead_lettered), (0, 0, 1))
+            self.assertEqual(store.traces, [], "unknown operation must not be reinterpreted as trace")
+            self.assertEqual(store.quarantine, [])
+            dead = outbox.dead_letters()
+            self.assertEqual(len(dead), 1)
+            self.assertIn("UNKNOWN_OUTBOX_OPERATION", dead[0]["last_error"])
 
     def _tmp(self):
         import tempfile
@@ -405,12 +492,11 @@ class Sol4OutboxDuplicateProcessingTests(unittest.TestCase):
                 len(store.quarantine), 1,
                 "attack 13: lease-expiry race must not insert the same entry twice downstream",
             )
-            self.assertEqual(replayed_b, 1)
-            # worker a's own completion must not claim credit for a row it
-            # no longer owned the lease on by the time its slow insert
-            # finally returned (Sol redteam v4: never report success on a
-            # zero-row completion).
-            self.assertEqual(replayed_a, 0)
+            # S9 heartbeat is stricter than the original S4 idempotency
+            # mitigation: worker b must not reclaim/execute the row while
+            # worker a is still in its slow downstream call.
+            self.assertEqual(replayed_b, 0)
+            self.assertEqual(replayed_a, 1)
 
     def test_attack14_crash_between_downstream_insert_and_outbox_delete_is_idempotent(self):
         with self._tmp() as tmp:

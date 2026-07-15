@@ -50,6 +50,18 @@ class FakeStore:
         ids = set(ids)
         self.quarantine = [r for r in self.quarantine if r.get("id") not in ids]
 
+    def delete_expired_quarantine(self, statuses, cutoff_iso):
+        statuses = set(statuses)
+        deleted = []
+        kept = []
+        for row in self.quarantine:
+            if row.get("status") in statuses and row.get("ts", "") < cutoff_iso:
+                deleted.append(row.get("id"))
+            else:
+                kept.append(row)
+        self.quarantine = kept
+        return deleted
+
     def seen_pass(self, pipeline, item_hash):
         if self.raise_on_seen_pass:
             raise RuntimeError("seen_pass failed")

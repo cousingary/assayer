@@ -87,12 +87,22 @@ class EnforceSizeLimitTests(unittest.TestCase):
 class EncryptionTests(unittest.TestCase):
     def setUp(self):
         self._old_key = os.environ.pop("ASSAYER_EVIDENCE_KEY", None)
+        self._old_keys = os.environ.pop("ASSAYER_EVIDENCE_KEYS", None)
+        self._old_key_id = os.environ.pop("ASSAYER_EVIDENCE_KEY_ID", None)
 
     def tearDown(self):
         if self._old_key is not None:
             os.environ["ASSAYER_EVIDENCE_KEY"] = self._old_key
         else:
             os.environ.pop("ASSAYER_EVIDENCE_KEY", None)
+        if self._old_keys is not None:
+            os.environ["ASSAYER_EVIDENCE_KEYS"] = self._old_keys
+        else:
+            os.environ.pop("ASSAYER_EVIDENCE_KEYS", None)
+        if self._old_key_id is not None:
+            os.environ["ASSAYER_EVIDENCE_KEY_ID"] = self._old_key_id
+        else:
+            os.environ.pop("ASSAYER_EVIDENCE_KEY_ID", None)
 
     def test_passthrough_when_not_configured(self):
         value = {"content": "secret stuff"}
@@ -107,10 +117,37 @@ class EncryptionTests(unittest.TestCase):
         value = {"content": "secret stuff", "n": 1}
         stored, encrypted = evidence.encrypt_if_configured(value)
         self.assertTrue(encrypted)
-        self.assertIsInstance(stored, str)
-        self.assertNotIn("secret stuff", stored)
+        self.assertIsInstance(stored, dict)
+        self.assertEqual(stored["key_id"], "default")
+        self.assertEqual(stored["algorithm"], "fernet")
+        self.assertNotIn("secret stuff", json.dumps(stored))
         recovered = evidence.decrypt_if_configured(stored, encrypted)
         self.assertEqual(recovered, value)
+
+    def test_round_trips_with_key_id_and_previous_key_map(self):
+        from cryptography.fernet import Fernet
+
+        old_key = Fernet.generate_key().decode("utf-8")
+        new_key = Fernet.generate_key().decode("utf-8")
+        os.environ["ASSAYER_EVIDENCE_KEYS"] = json.dumps({"old": old_key, "active": new_key})
+        os.environ["ASSAYER_EVIDENCE_KEY_ID"] = "active"
+        value = {"content": "classified"}
+
+        stored, encrypted = evidence.encrypt_if_configured(value)
+
+        self.assertTrue(encrypted)
+        self.assertEqual(stored["key_id"], "active")
+        self.assertEqual(evidence.decrypt_if_configured(stored, encrypted), value)
+
+    def test_decrypt_rejects_unavailable_key_id(self):
+        from cryptography.fernet import Fernet
+
+        os.environ["ASSAYER_EVIDENCE_KEYS"] = json.dumps({"k1": Fernet.generate_key().decode("utf-8")})
+        os.environ["ASSAYER_EVIDENCE_KEY_ID"] = "k1"
+        stored, encrypted = evidence.encrypt_if_configured({"content": "x"})
+        os.environ["ASSAYER_EVIDENCE_KEYS"] = json.dumps({"k2": Fernet.generate_key().decode("utf-8")})
+        with self.assertRaises(RuntimeError):
+            evidence.decrypt_if_configured(stored, encrypted)
 
     def test_decrypt_raises_when_key_missing(self):
         with self.assertRaises(RuntimeError):
@@ -119,6 +156,10 @@ class EncryptionTests(unittest.TestCase):
     def test_decrypt_passthrough_when_not_encrypted(self):
         value = {"content": "plain"}
         self.assertEqual(evidence.decrypt_if_configured(value, False), value)
+
+    def test_classified_evidence_requires_encryption(self):
+        with self.assertRaises(RuntimeError):
+            evidence.store_representation_for_classification({"content": "secret"}, "classified")
 
 
 class PurgeExpiredQuarantineTests(unittest.TestCase):

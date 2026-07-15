@@ -53,6 +53,9 @@ SENSITIVE_VALUE_PATTERNS = (
 MAX_PAYLOAD_BYTES = 262144  # 256 KiB
 
 _EVIDENCE_KEY_ENV = "ASSAYER_EVIDENCE_KEY"
+_EVIDENCE_KEYS_ENV = "ASSAYER_EVIDENCE_KEYS"
+_EVIDENCE_KEY_ID_ENV = "ASSAYER_EVIDENCE_KEY_ID"
+DEFAULT_EVIDENCE_KEY_ID = "default"
 DEFAULT_DELETION_AUDIT_PATH = "/opt/assayer/deletion_audit.jsonl"
 
 
@@ -143,39 +146,92 @@ def enforce_size_limit(value, max_bytes=MAX_PAYLOAD_BYTES):
 
 
 def encryption_configured():
-    return bool(os.environ.get(_EVIDENCE_KEY_ENV))
+    return bool(os.environ.get(_EVIDENCE_KEY_ENV) or os.environ.get(_EVIDENCE_KEYS_ENV))
+
+
+def _configured_keys():
+    keys_json = os.environ.get(_EVIDENCE_KEYS_ENV)
+    if keys_json:
+        keys = json.loads(keys_json)
+        if not isinstance(keys, dict) or not keys:
+            raise RuntimeError(f"{_EVIDENCE_KEYS_ENV} must be a non-empty JSON object")
+        return {str(k): str(v) for k, v in keys.items()}
+    legacy = os.environ.get(_EVIDENCE_KEY_ENV)
+    if legacy:
+        return {os.environ.get(_EVIDENCE_KEY_ID_ENV, DEFAULT_EVIDENCE_KEY_ID): legacy}
+    return {}
+
+
+def _active_key():
+    keys = _configured_keys()
+    if not keys:
+        return None, None
+    key_id = os.environ.get(_EVIDENCE_KEY_ID_ENV) or next(iter(keys))
+    if key_id not in keys:
+        raise RuntimeError(f"active evidence key_id {key_id!r} is not configured")
+    return key_id, keys[key_id]
 
 
 def encrypt_if_configured(value):
-    """Optional authenticated encryption at rest (Fernet: AES-128-CBC +
-    HMAC-SHA256, tamper-evident). Opt-in via ASSAYER_EVIDENCE_KEY -- with no
-    key configured this is a pure passthrough, so existing callers/tests see
-    no behavior change. Returns (stored_repr, encrypted: bool); stored_repr
-    is the original value when not encrypted, or an opaque token string when
-    it is."""
-    key = os.environ.get(_EVIDENCE_KEY_ENV)
+    """Optional authenticated encryption at rest with key identity metadata.
+
+    Opt in via ASSAYER_EVIDENCE_KEYS='{"key-id":"fernet-key"}' plus
+    ASSAYER_EVIDENCE_KEY_ID, or the legacy ASSAYER_EVIDENCE_KEY. Returns
+    (stored_repr, encrypted). When encrypted, stored_repr is an envelope with
+    key_id, algorithm, format_version, nonce field, and ciphertext.
+    """
+    key_id, key = _active_key()
     if not key:
         return value, False
     from cryptography.fernet import Fernet
 
     fernet = Fernet(key.encode("utf-8") if isinstance(key, str) else key)
     token = fernet.encrypt(json.dumps(value, default=str).encode("utf-8"))
-    return token.decode("utf-8"), True
+    return {
+        "format_version": 1,
+        "algorithm": "fernet",
+        "key_id": key_id,
+        "nonce": None,
+        "ciphertext": token.decode("utf-8"),
+        "auth_metadata": {"serializer": "json"},
+    }, True
 
 
 def decrypt_if_configured(stored, encrypted):
     if not encrypted:
         return stored
-    key = os.environ.get(_EVIDENCE_KEY_ENV)
-    if not key:
+    keys = _configured_keys()
+    if not keys:
         raise RuntimeError(
-            f"{_EVIDENCE_KEY_ENV} is not set but this row is marked payload_encrypted=true"
+            f"no evidence decryption keys are set but this row is marked payload_encrypted=true"
         )
     from cryptography.fernet import Fernet
 
+    if isinstance(stored, dict):
+        if stored.get("algorithm") != "fernet" or stored.get("format_version") != 1:
+            raise RuntimeError("unsupported encrypted evidence envelope")
+        key_id = stored.get("key_id")
+        if key_id not in keys:
+            raise RuntimeError(f"evidence key_id {key_id!r} is unavailable")
+        key = keys[key_id]
+        token = stored["ciphertext"]
+    else:
+        # Backward compatibility for pre-S9 rows that stored only the token.
+        key_id, key = _active_key()
+        if not key:
+            raise RuntimeError("legacy encrypted evidence has no active key available")
+        token = stored
     fernet = Fernet(key.encode("utf-8") if isinstance(key, str) else key)
-    plaintext = fernet.decrypt(stored.encode("utf-8") if isinstance(stored, str) else stored)
+    plaintext = fernet.decrypt(token.encode("utf-8") if isinstance(token, str) else token)
     return json.loads(plaintext)
+
+
+def store_representation_for_classification(value, classification):
+    """Return (stored, encrypted) and require encryption for classified evidence."""
+    stored, encrypted = encrypt_if_configured(value)
+    if classification in ("classified", "sensitive") and not encrypted:
+        raise RuntimeError(f"{classification} evidence requires configured encryption")
+    return stored, encrypted
 
 
 def _append_audit(path, record):
@@ -197,15 +253,17 @@ def purge_expired_quarantine(store, retention_days, statuses=("released", "disca
     now = now or datetime.now(timezone.utc)
     cutoff_iso = (now - timedelta(days=retention_days)).isoformat()
 
-    expired_ids = []
-    for status in statuses:
-        for row in store.list_quarantine(status=status) or []:
-            ts = row.get("ts") or ""
-            if ts and ts < cutoff_iso:
-                expired_ids.append(row["id"])
-
-    if expired_ids:
-        store.delete_quarantine(expired_ids)
+    if hasattr(store, "delete_expired_quarantine"):
+        expired_ids = store.delete_expired_quarantine(statuses, cutoff_iso) or []
+    else:
+        expired_ids = []
+        for status in statuses:
+            for row in store.list_quarantine(status=status) or []:
+                ts = row.get("ts") or ""
+                if ts and ts < cutoff_iso:
+                    expired_ids.append(row["id"])
+        if expired_ids:
+            store.delete_quarantine(expired_ids)
 
     record = {
         "executed_at": now.isoformat(),
