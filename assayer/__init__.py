@@ -50,27 +50,34 @@ def verify(item: dict, checks: list) -> VerifyResult:
 
 
 def verify_scored(item: dict, checks: list, *, enforcement: str = "blocking") -> VerifyResult:
-    """Like verify(), but computes a 4-way verdict (pass|advisory|fail|error)
-    instead of verify()'s 2-way (pass|fail). Additive: verify() itself is
-    unchanged, so every existing caller/test keeps working exactly as before.
+    """Like verify(), but computes a 5-way verdict
+    (pass|advisory|fail|error|no_applicable_checks) instead of verify()'s
+    2-way (pass|fail). Additive: verify() itself is unchanged, so every
+    existing caller/test keeps working exactly as before.
 
     Priority: a validator that raised (had_error) is always "error" —
     regardless of enforcement, a check that crashed did not produce a
-    trustworthy result. An empty check list on a "blocking" profile is also
-    "error" (nothing was actually verified, so a silent "pass" would be a
-    false assurance). Otherwise, failed checks are "fail" under blocking
-    enforcement and "advisory" under advisory/telemetry enforcement (the
-    verdict enum has no separate "telemetry" state; telemetry and advisory
-    both mean "recorded, never blocks", so they share the "advisory"
-    verdict — the distinction between them is enforcement-mode metadata the
-    caller already has, not something the verdict itself needs to encode).
+    trustworthy result. An empty check list on a "blocking" profile is
+    "no_applicable_checks" (Sol redteam v7 S8: distinct from "error" so a
+    profile/registry misconfiguration that silently resolves zero checks is
+    diagnosable apart from a check that actually crashed — nothing was
+    verified either way, and both are blocking, but they are not the same
+    failure). An empty check list under advisory/telemetry enforcement is
+    "pass" (it was never going to block anything, so there is nothing unsafe
+    about a genuinely check-less advisory profile). Otherwise, failed checks
+    are "fail" under blocking enforcement and "advisory" under
+    advisory/telemetry enforcement (the verdict enum has no separate
+    "telemetry" state; telemetry and advisory both mean "recorded, never
+    blocks", so they share the "advisory" verdict — the distinction between
+    them is enforcement-mode metadata the caller already has, not something
+    the verdict itself needs to encode).
     """
     base = verify(item, checks)
 
     if base.had_error:
         verdict = "error"
     elif not checks and enforcement == "blocking":
-        verdict = "error"
+        verdict = "no_applicable_checks"
     elif base.failed:
         verdict = "fail" if enforcement == "blocking" else "advisory"
     else:

@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from assayer import item_hash, quarantine_item, trace
+from assayer import item_hash, quarantine_item, trace, verify_scored
 from assayer.outbox import Outbox, OutboxError
 from tests.fake_store import FakeStore
 
@@ -192,6 +192,34 @@ class QuarantineItemTests(unittest.TestCase):
                 reasons=["bad"],
                 outbox=AlwaysFailingOutbox(),
             )
+
+
+class VerifyScoredEmptyChecksTests(unittest.TestCase):
+    """Sol redteam v7 S8 (corpus case 38, TestV7Case38 in
+    internal/redteam/v7_s8_assayer_test.go): a profile/registry/config error
+    that resolves to zero checks must not silently read as a passing
+    evaluation. Before this fix, verify_scored's own "nothing was actually
+    verified" branch collapsed into the generic "error" verdict a crashed
+    check also produces; a caller (or an operator reading traces) could not
+    tell "misconfigured, ran nothing" apart from "a validator blew up".
+    """
+
+    def test_no_checks_under_blocking_enforcement_is_no_applicable_checks(self):
+        result = verify_scored({"content": "anything"}, [], enforcement="blocking")
+        self.assertEqual(result.verdict, "no_applicable_checks")
+        self.assertFalse(result.had_error)
+        self.assertEqual(result.failed, [])
+
+    def test_no_checks_under_advisory_enforcement_still_passes(self):
+        # No-over-blocking companion: a genuinely check-less ADVISORY profile
+        # was never going to block anything, so zero checks there is not a
+        # safety gap the way it is under a blocking profile.
+        result = verify_scored({"content": "anything"}, [], enforcement="advisory")
+        self.assertEqual(result.verdict, "pass")
+
+    def test_no_checks_under_telemetry_enforcement_still_passes(self):
+        result = verify_scored({"content": "anything"}, [], enforcement="telemetry")
+        self.assertEqual(result.verdict, "pass")
 
 
 if __name__ == "__main__":
