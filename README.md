@@ -5,7 +5,7 @@ Verification + trace layer for unattended LLM pipelines running on a VPS.
 ## Flow
 1. Build checks from `assayer.checks` (schema, nonempty, max_len,
    no_boilerplate, no_placeholder, language_sane, dedup).
-2. `assayer.verify(item, checks)` -> `VerifyResult(verdict, checks, failed, had_error)`.
+2. `assayer.verify(item, checks, allow_empty=False)` -> `VerifyResult(verdict, checks, failed, had_error)`.
 3. `assayer.trace(store, pipeline=, job_id=, item_hash=, verdict=, checks=,
    model=)` records the outcome. Never raises.
 4. On fail, `assayer.quarantine_item(store, pipeline=, item_hash=, payload=,
@@ -70,6 +70,10 @@ requests must still get distinct ids). `trace_id` is honestly `null`: Phase
 trace row yet for it to point at. A future caller that persists a trace row
 can set `trace_id` once that row exists; until then, treat a non-null
 `trace_id` as meaningful and a null one as "not traced," never as an error.
+
+An empty check list is non-passing by default: `verify(item, [])` returns
+`no_applicable_checks`. Callers that intentionally want telemetry-only
+behavior must opt in with `verify(item, [], allow_empty=True)`.
 
 ## Packaging
 

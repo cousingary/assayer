@@ -20,13 +20,20 @@ class VerifyResult:
     had_error: bool = False
 
 
-def verify(item: dict, checks: list) -> VerifyResult:
+def verify(item: dict, checks: list, *, allow_empty: bool = False) -> VerifyResult:
     """Run each check against item, aggregate into a VerifyResult.
 
     Each check is an object with `.name` (str) and is callable as
     `check(item) -> (ok: bool, detail: str)`. If a check raises, it counts
     as a failure and sets had_error=True on the result.
+
+    Zero checks are non-passing by default: callers must opt into
+    telemetry-only semantics with allow_empty=True.
     """
+    if not checks:
+        verdict = "pass" if allow_empty else "no_applicable_checks"
+        return VerifyResult(verdict=verdict, checks={}, failed=[], had_error=False)
+
     results = {}
     failed = []
     had_error = False
@@ -52,8 +59,7 @@ def verify(item: dict, checks: list) -> VerifyResult:
 def verify_scored(item: dict, checks: list, *, enforcement: str = "blocking") -> VerifyResult:
     """Like verify(), but computes a 5-way verdict
     (pass|advisory|fail|error|no_applicable_checks) instead of verify()'s
-    2-way (pass|fail). Additive: verify() itself is unchanged, so every
-    existing caller/test keeps working exactly as before.
+    lower-level verdicts.
 
     Priority: a validator that raised (had_error) is always "error" —
     regardless of enforcement, a check that crashed did not produce a
@@ -72,11 +78,11 @@ def verify_scored(item: dict, checks: list, *, enforcement: str = "blocking") ->
     them is enforcement-mode metadata the caller already has, not something
     the verdict itself needs to encode).
     """
-    base = verify(item, checks)
+    base = verify(item, checks, allow_empty=enforcement != "blocking")
 
     if base.had_error:
         verdict = "error"
-    elif not checks and enforcement == "blocking":
+    elif base.verdict == "no_applicable_checks":
         verdict = "no_applicable_checks"
     elif base.failed:
         verdict = "fail" if enforcement == "blocking" else "advisory"

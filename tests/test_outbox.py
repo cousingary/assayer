@@ -257,6 +257,9 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
 
             # Right after the crash the row is still leased (processing);
             # a fresh replay must not touch it until the lease expires.
+            deadline = time.time() + 1.0
+            while time.time() < deadline and len(outbox.pending()) != 0:
+                time.sleep(0.01)
             self.assertEqual(len(outbox.pending()), 0)
 
             time.sleep(1.2)

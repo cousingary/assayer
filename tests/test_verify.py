@@ -1,6 +1,6 @@
 import unittest
 
-from assayer import verify
+from assayer import verify, verify_scored
 from assayer.checks import Check
 
 
@@ -46,10 +46,19 @@ class VerifyTests(unittest.TestCase):
         self.assertIn("check error", result.checks["b"]["detail"])
         self.assertIn("boom", result.checks["b"]["detail"])
 
-    def test_no_checks_means_pass(self):
+    def test_no_checks_is_non_passing_by_default(self):
         result = verify({"x": 1}, [])
+        self.assertEqual(result.verdict, "no_applicable_checks")
+        self.assertEqual(result.failed, [])
+
+    def test_no_checks_can_explicitly_allow_empty(self):
+        result = verify({"x": 1}, [], allow_empty=True)
         self.assertEqual(result.verdict, "pass")
         self.assertEqual(result.failed, [])
+
+    def test_verify_scored_advisory_empty_still_passes(self):
+        result = verify_scored({"x": 1}, [], enforcement="advisory")
+        self.assertEqual(result.verdict, "pass")
 
 
 if __name__ == "__main__":
