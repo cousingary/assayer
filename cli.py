@@ -13,13 +13,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
-
 from assayer import checks as checks_mod
 from assayer import profiles as profiles_mod
 from assayer import verify_scored
@@ -398,6 +391,27 @@ def _cmd_evaluate(args, stdin_text=None):
     return 0
 
 
+def _load_env_for_online_commands():
+    """Load a local .env file's variables into the process environment, for
+    the subcommands below that genuinely need online Store/Supabase
+    credentials (quarantine, stats).
+
+    Sol9 P0-4 `.env` credential-policy violation: this used to run
+    unconditionally at module import, before command dispatch -- so the
+    offline `evaluate` subcommand (which Governator declares
+    CredentialPolicyNone for) could still inherit secrets from a repo
+    `.env` file. `evaluate` must never call this; only the commands
+    reaching `Store()` below do, and only after `evaluate` has already
+    returned.
+    """
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -405,6 +419,7 @@ def main(argv=None):
     if args.command == "evaluate":
         return _cmd_evaluate(args)
 
+    _load_env_for_online_commands()
     store = Store()
 
     if args.command == "quarantine":

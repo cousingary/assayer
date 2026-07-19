@@ -376,6 +376,75 @@ class EvaluateCLITests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertNotIn("supabase", proc.stderr.lower())
 
+    def test_evaluate_never_loads_env_canary_secret(self):
+        # Sol9 P0-4 `.env` credential-policy violation: cli.py used to call
+        # load_dotenv() unconditionally at module import, before command
+        # dispatch, so the offline `evaluate` subcommand (which Governator
+        # declares CredentialPolicyNone for) could still inherit secrets
+        # from a repo .env file. A canary written to REPO_ROOT/.env must be
+        # invisible to evaluate's own process environment, not just absent
+        # from its stdout/stderr.
+        #
+        # REPO_ROOT/.env is the real project directory's env file (the one
+        # python-dotenv's default search would actually find, since cli.py
+        # itself lives there and subprocess cwd is REPO_ROOT) -- back up
+        # and restore any file already there so this never clobbers a
+        # developer's real .env.
+        env_path = REPO_ROOT / ".env"
+        canary_name = "ASSAYER_TEST_CANARY_SECRET"
+        canary_value = "canary-secret-must-never-leak-3f9c7a"
+        original = env_path.read_text() if env_path.exists() else None
+
+        # A driver script that imports cli fresh (so any module-level
+        # load_dotenv() regression fires), dispatches exactly the `evaluate`
+        # path via cli.main(), then inspects ITS OWN os.environ afterward --
+        # the only way to observe whether the offline path polluted the
+        # process environment, since a subprocess can't be inspected from
+        # the outside after it exits.
+        driver_src = f"""
+import io, json, os, sys
+sys.path.insert(0, {str(REPO_ROOT)!r})
+import cli
+
+stdin_payload = json.dumps({{
+    "run_id": "run-1", "attempt_id": "run-1", "job_id": "job-1",
+    "contract_hash": "deadbeef", "job_type": "coding", "backend": "claude-code",
+    "artifact_name": "output", "artifact_sha256": "abc123",
+    "artifact_declared_path": "output", "artifact_stored_path": "",
+    "artifact_media_type": "", "artifact_language": "",
+    "payload": {{"content": "This is a real, sufficiently long piece of generated content."}},
+    "check_profile": "coding-output-v1", "policy_version": "test-policy-v1",
+    "protocol_version": {ARTIFACT_PROTOCOL_VERSION!r},
+}})
+sys.stdin = io.StringIO(stdin_payload)
+cli.main(["evaluate", "--profile", "coding-output-v1"])
+
+if os.environ.get({canary_name!r}):
+    print("CANARY_LEAKED", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+"""
+        try:
+            env_path.write_text(f"{canary_name}={canary_value}\n")
+            proc = subprocess.run(
+                [sys.executable, "-c", driver_src],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                timeout=30,
+            )
+        finally:
+            if original is None:
+                env_path.unlink(missing_ok=True)
+            else:
+                env_path.write_text(original)
+
+        self.assertNotIn(canary_value, proc.stdout)
+        self.assertNotIn(canary_value, proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
+
 
 if __name__ == "__main__":
     unittest.main()
