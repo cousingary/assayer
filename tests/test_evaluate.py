@@ -445,6 +445,58 @@ sys.exit(0)
         verdict = json.loads(proc.stdout)
         self.assertEqual(verdict["verdict"], "pass", verdict)
 
+    def test_evaluate_succeeds_under_isolated_startup_dash_s_flag(self):
+        # Governator rc4 Session 5 (Sol10 P0-5) always launches this CLI's
+        # `evaluate` subcommand with the interpreter's `-S` flag, so no
+        # ambient sitecustomize.py/.pth file anywhere on the host can ever
+        # execute before cli.py's own code runs -- see
+        # governator/internal/assay/assay.go's evaluateArguments and
+        # snapshot.go's RuntimeManifest doc comment. `-S` disables Python's
+        # `site` module entirely, which also means site-packages is never
+        # added to sys.path. This is the load-bearing assumption the Go-side
+        # fix depends on: if `evaluate` ever started needing anything site
+        # initialization provides, it would silently break under the real
+        # bridge while still passing every other test in this file (which
+        # invoke this CLI without -S). Regression-pin it here directly.
+        args = [sys.executable, "-S", str(CLI_PATH), "evaluate", "--profile", "coding-output-v1"]
+        proc = subprocess.run(
+            args, input=json.dumps(base_request()), capture_output=True, text=True,
+            cwd=str(REPO_ROOT), timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
+
+    def test_evaluate_subprocess_never_imports_supabase_module(self):
+        # Governator's Session 5 fix relies on `evaluate` never needing a
+        # third-party import (only that lets it drop site-packages/PYTHONPATH
+        # exposure and run under -S at all -- see RuntimeManifest's doc
+        # comment). test_no_network_no_store_import_touched above only
+        # greps stderr for the literal string "supabase"; this test inspects
+        # sys.modules directly, in-process, via the same cli.main() driver
+        # pattern as test_evaluate_never_loads_env_canary_secret above, so a
+        # future regression that imports supabase without printing its name
+        # anywhere still fails this test.
+        driver_src = f"""
+import io, json, sys
+sys.path.insert(0, {str(REPO_ROOT)!r})
+import cli
+
+stdin_payload = json.dumps({base_request()!r})
+sys.stdin = io.StringIO(stdin_payload)
+cli.main(["evaluate", "--profile", "coding-output-v1"])
+
+print("SUPABASE_IMPORTED=" + str("supabase" in sys.modules), file=sys.stderr)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-S", "-c", driver_src],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUPABASE_IMPORTED=False", proc.stderr, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["verdict"], "pass", verdict)
+
 
 if __name__ == "__main__":
     unittest.main()
