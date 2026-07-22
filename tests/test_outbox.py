@@ -10,6 +10,17 @@ from assayer.outbox import Outbox, OutboxError
 from tests.fake_store import FakeStore
 
 
+def _join_and_assert_terminated(case, handle, timeout, label):
+    """P1-1 (Sol10 rc4 Session 8): join(timeout=...) alone proves nothing --
+    it returns the same way whether the handle finished or merely outlived
+    the deadline. Every thread/process join in this module goes through
+    this helper so a hung child is a test failure here, not a leaked
+    process discovered later by the release matrix's clean-shutdown check.
+    """
+    handle.join(timeout=timeout)
+    case.assertFalse(handle.is_alive(), f"{label} did not terminate within {timeout}s")
+
+
 class BlockingStore:
     """Store whose insert_quarantine blocks until released -- lets a test
     hold replay() inside its "persist to backend" step so a concurrent
@@ -193,7 +204,7 @@ class Sol3OutboxConcurrencyTests(unittest.TestCase):
             entry_b = outbox2.enqueue("assayer_quarantine", {"which": "b"})
 
             store.release.set()
-            t.join(timeout=5)
+            _join_and_assert_terminated(self, t, 5, "replay thread")
 
             replayed, still_pending, dead_lettered = result["value"]
             self.assertEqual(replayed, 1)
@@ -227,8 +238,8 @@ class Sol3OutboxConcurrencyTests(unittest.TestCase):
             tb = threading.Thread(target=worker, args=("b", outbox_b, store_b))
             ta.start()
             tb.start()
-            ta.join(timeout=10)
-            tb.join(timeout=10)
+            _join_and_assert_terminated(self, ta, 10, "worker a thread")
+            _join_and_assert_terminated(self, tb, 10, "worker b thread")
 
             total_replayed = results["a"][0] + results["b"][0]
             self.assertEqual(total_replayed, n)
@@ -252,8 +263,9 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
             ctx = multiprocessing.get_context("spawn")
             proc = ctx.Process(target=_claim_lease_then_sigkill, args=(path, 1))
             proc.start()
-            proc.join(timeout=10)
+            _join_and_assert_terminated(self, proc, 10, "crash-recovery child process")
             self.assertEqual(proc.exitcode, -signal.SIGKILL, "child must have been hard-killed")
+            proc.close()
 
             # Right after the crash the row is still leased (processing);
             # a fresh replay must not touch it until the lease expires.
@@ -262,7 +274,12 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(len(outbox.pending()), 0)
 
-            time.sleep(1.2)
+            # P1-1 (Sol10 rc4 Session 8): a 0.2s margin over the 1s lease
+            # flaked intermittently under host contention (observed
+            # replayed=0 instead of 1 during a heavily parallel test run) --
+            # widened to remove the timing dependency without changing what
+            # the test proves.
+            time.sleep(2.5)
             store = FakeStore()
             replayed, still_pending, dead_lettered = outbox.replay(store)
             self.assertEqual(replayed, 1)
@@ -325,7 +342,7 @@ class Sol6OutboxLeaseHeartbeatTests(unittest.TestCase):
             replayed_b, still_pending_b, dead_b = outbox_b.replay(store, lease_seconds=0.2)
 
             store.release.set()
-            ta.join(timeout=5)
+            _join_and_assert_terminated(self, ta, 5, "worker a thread")
 
             self.assertEqual(len(store.calls), 1, "second worker must not execute a leased slow op")
             self.assertEqual((replayed_b, still_pending_b, dead_b), (0, 0, 0))
@@ -488,7 +505,7 @@ class Sol4OutboxDuplicateProcessingTests(unittest.TestCase):
             replayed_b, still_pending_b, dead_b = outbox_b.replay(store)
 
             store.release.set()
-            ta.join(timeout=5)
+            _join_and_assert_terminated(self, ta, 5, "worker a thread")
             replayed_a, still_pending_a, dead_a = result["a"]
 
             self.assertEqual(
@@ -641,7 +658,7 @@ class Sol4OutboxRobustnessTests(unittest.TestCase):
             for t in threads:
                 t.start()
             for t in threads:
-                t.join(timeout=10)
+                _join_and_assert_terminated(self, t, 10, "enqueue worker thread")
 
             self.assertEqual(errors, [])
             self.assertEqual(len(outbox.pending()), 80)
