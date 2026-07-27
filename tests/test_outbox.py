@@ -274,12 +274,26 @@ class Sol3OutboxCrashRecoveryTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(len(outbox.pending()), 0)
 
-            # P1-1 (Sol10 rc4 Session 8): a 0.2s margin over the 1s lease
-            # flaked intermittently under host contention (observed
-            # replayed=0 instead of 1 during a heavily parallel test run) --
-            # widened to remove the timing dependency without changing what
-            # the test proves.
-            time.sleep(2.5)
+            # Wait for the observable condition the test needs rather than
+            # guessing how long a one-second lease plus host scheduling will
+            # take. pending() performs the production stale-lease reclaim,
+            # so this is also the reproduction harness for the exact failure:
+            # it records the stored lease deadline on timeout and never asks
+            # replay() to race an unexpired lease.
+            recovery_deadline = time.monotonic() + 10.0
+            while time.monotonic() < recovery_deadline:
+                if len(outbox.pending()) == 1:
+                    break
+                time.sleep(0.01)
+            else:
+                row = outbox._conn.execute(
+                    "SELECT status, attempts, lease_owner, lease_until FROM outbox_entries"
+                ).fetchone()
+                self.fail(
+                    "crashed worker lease did not become reclaimable within 10s; "
+                    f"row={row!r}, wall_time={time.time()!r}"
+                )
+
             store = FakeStore()
             replayed, still_pending, dead_lettered = outbox.replay(store)
             self.assertEqual(replayed, 1)
