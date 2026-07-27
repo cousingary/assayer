@@ -408,7 +408,24 @@ class Outbox:
                 self._outer = outer
                 self._stop = threading.Event()
                 self.lost = threading.Event()
-                self._interval = max(0.05, min(lease_seconds / 3.0, 5.0))
+                # The renewal interval must always stay meaningfully BELOW
+                # the lease it renews, or the heartbeat can only fire at the
+                # instant the lease expires and any scheduling delay hands
+                # the row to another worker. The previous form,
+                # max(0.05, min(lease_seconds / 3.0, 5.0)), had a flat 0.05
+                # floor that is not guaranteed to be smaller than
+                # lease_seconds: at lease_seconds=0.05 the interval clamped
+                # to the ENTIRE lease (margin zero), and for any lease below
+                # 0.15 the intended one-third margin was eroded or inverted.
+                # Under load that reliably lost the race -- the failure
+                # attack 13 reproduces. Floor at a quarter of the lease so
+                # the margin scales with it, and keep the 5s ceiling and a
+                # small absolute lower bound to avoid a busy loop on a
+                # pathologically short lease.
+                self._interval = min(
+                    max(lease_seconds / 4.0, 0.001),
+                    min(lease_seconds / 3.0, 5.0),
+                )
                 self._thread = threading.Thread(target=self._run, daemon=True)
                 self._thread.start()
 
