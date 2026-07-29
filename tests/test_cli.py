@@ -78,8 +78,8 @@ class ComputeStatsTests(unittest.TestCase):
 class IdentityTests(unittest.TestCase):
     def test_identity_is_complete_and_self_consistent(self):
         identity = assayer_identity()
-        self.assertEqual(identity["version"], "1.1.7")
-        self.assertEqual(identity["tag"], "v1.1.7")
+        self.assertEqual(identity["version"], "1.1.8")
+        self.assertEqual(identity["tag"], "v1.1.8")
         self.assertEqual(len(identity["commit"]), 40)
         self.assertEqual(len(identity["package_tree_hash"]), 64)
         self.assertEqual(identity["schema_version"], "0004")

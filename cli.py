@@ -18,7 +18,6 @@ from datetime import datetime, timedelta, timezone
 from assayer import checks as checks_mod
 from assayer import profiles as profiles_mod
 from assayer import verify_scored
-from assayer.store import Store
 
 _SINCE_RE = re.compile(r"^(\d+)([dh])$")
 
@@ -508,6 +507,8 @@ def main(argv=None):
         return 0
 
     _load_env_for_online_commands()
+    from assayer.store import Store
+
     store = Store()
 
     if args.command == "quarantine":
