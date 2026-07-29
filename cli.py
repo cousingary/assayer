@@ -7,7 +7,10 @@ optionally `python-dotenv` for local env loading.
 import argparse
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -42,6 +45,78 @@ EVALUATE_PROTOCOL_VERSION = "gov-assay-evaluate-v2"
 # fields) or a mismatched one must fail closed, not silently skip the
 # file-aware checks that depend on them.
 ARTIFACT_PROTOCOL_VERSION = "gov-assay-artifact-protocol-v1"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _project_version(repo: Path) -> str:
+    text = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', text)
+    if not match:
+        raise RuntimeError("pyproject.toml has no project version")
+    return match.group(1)
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", os.fspath(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def package_tree_hash(repo: Path) -> str:
+    """Hash exactly the executable Python tree Governator snapshots.
+
+    cli.py is named __main__.py in Governator's sealed archive; the package
+    files retain their repository-relative paths.  The deliberately simple
+    path/NUL/content-hash/newline encoding is shared with
+    internal/assay/snapshot.go so the release gate can prove the tool that
+    emitted this identity and the bytes Governator executed are one tree.
+    """
+    entries = [("__main__.py", repo / "cli.py")]
+    entries.extend(
+        (path.relative_to(repo).as_posix(), path)
+        for path in (repo / "assayer").rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+    digest = hashlib.sha256()
+    for rel, path in sorted(entries):
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def assayer_identity() -> dict:
+    """Return release-verifiable identity from Assayer itself, never a caller claim."""
+    repo = _repo_root()
+    version = _project_version(repo)
+    commit = _git(repo, "rev-parse", "HEAD")
+    tag = _git(repo, "describe", "--tags", "--exact-match", "HEAD")
+    if tag not in {version, f"v{version}"}:
+        raise RuntimeError(f"tag {tag!r} does not match project version {version!r}")
+    clean = _git(repo, "status", "--porcelain") == ""
+    if not clean:
+        raise RuntimeError("Assayer checkout is dirty")
+    migrations = sorted((repo / "migrations").glob("*.sql"))
+    schema_version = migrations[-1].stem.split("_", 1)[0] if migrations else ""
+    if not schema_version:
+        raise RuntimeError("Assayer has no schema migration version")
+    return {
+        "version": version,
+        "tag": tag,
+        "commit": commit,
+        "package_tree_hash": package_tree_hash(repo),
+        "schema_version": schema_version,
+        "python_runtime": sys.version.replace("\n", " "),
+        "clean": clean,
+    }
 
 
 def parse_since(value: str) -> str:
@@ -117,6 +192,8 @@ def _build_parser():
 
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("--profile", default=None)
+
+    sub.add_parser("identity")
 
     return parser
 
@@ -426,6 +503,9 @@ def main(argv=None):
 
     if args.command == "evaluate":
         return _cmd_evaluate(args)
+    if args.command == "identity":
+        print(json.dumps(assayer_identity(), sort_keys=True))
+        return 0
 
     _load_env_for_online_commands()
     store = Store()

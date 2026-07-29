@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from cli import compute_stats, parse_since
+from cli import assayer_identity, compute_stats, parse_since
 
 
 class ParseSinceTests(unittest.TestCase):
@@ -73,6 +73,18 @@ class ComputeStatsTests(unittest.TestCase):
         self.assertEqual(per_pipeline, {})
         self.assertEqual(per_check_fail, {})
         self.assertEqual(per_model, {})
+
+
+class IdentityTests(unittest.TestCase):
+    def test_identity_is_complete_and_self_consistent(self):
+        identity = assayer_identity()
+        self.assertEqual(identity["version"], "1.1.7")
+        self.assertEqual(identity["tag"], "v1.1.7")
+        self.assertEqual(len(identity["commit"]), 40)
+        self.assertEqual(len(identity["package_tree_hash"]), 64)
+        self.assertEqual(identity["schema_version"], "0004")
+        self.assertTrue(identity["clean"])
+        self.assertIn("Python", identity["python_runtime"])
 
 
 if __name__ == "__main__":
