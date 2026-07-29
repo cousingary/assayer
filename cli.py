@@ -113,7 +113,7 @@ def assayer_identity() -> dict:
         "commit": commit,
         "package_tree_hash": package_tree_hash(repo),
         "schema_version": schema_version,
-        "python_runtime": sys.version.replace("\n", " "),
+        "python_runtime": f"Python {sys.version.replace(chr(10), ' ')}",
         "clean": clean,
     }
 
