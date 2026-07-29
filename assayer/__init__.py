@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from assayer import evidence
-from assayer.outbox import Outbox, OutboxError
 
 
 @dataclass
@@ -191,6 +190,8 @@ def quarantine_item(store, *, pipeline, item_hash, payload, input_ref, reasons, 
     try:
         return store.insert_quarantine(row)
     except Exception:
+        from assayer.outbox import Outbox
+
         ob = outbox if outbox is not None else Outbox()
         ob.enqueue("assayer_quarantine", row)
         return None
