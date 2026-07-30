@@ -114,3 +114,16 @@ if result.verdict != "pass":
                      payload=item, input_ref=job_id, reasons=result.failed)
 ```
 `assay` CLI (`cli.py`): quarantine/stats, incl. `--brief` for a daily digest.
+
+## Dependency lockfiles
+
+This repo carries two lockfiles with distinct authority:
+
+- **`requirements-lock.txt`** is the release-pinned artifact. The Python-matrix
+  venvs (3.10–3.13) used by Governator's release pipeline are built from it,
+  and it is the file signed into the source closure.
+- **`uv.lock`** is a development convenience for contributors using `uv`. It is
+  not part of the release evidence.
+
+`scripts/assayer_verify.sh` (in the Governator repo) asserts the two are
+consistent at release time. If they diverge, the release fails.
