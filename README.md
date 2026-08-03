@@ -1,6 +1,28 @@
 # assayer
 
+**"Trust the model's output" isn't a QA strategy.** Assayer is the verification and trace layer for unattended LLM pipelines: every generated item gets checked, every verdict gets recorded, every failure gets quarantined durably — so a 3am content run can't silently ship garbage.
+
 Verification + trace layer for unattended LLM pipelines running on a VPS.
+
+## Why you'd run it
+
+For anything where the output goes live without a human in the loop — published articles, generated code, customer-facing copy, data inserts — you need a gate that runs every time and keeps the receipts:
+
+- **Catches bad output before it ships** — schema, nonempty, max length, boilerplate, placeholder, language-sanity, and dedup checks on every item.
+- **Never silently drops a failure** — failed items go to a durable SQLite-WAL quarantine outbox with lease/replay semantics; a true double-failure raises instead of swallowing evidence.
+- **Keeps an audit trail** — every verdict is traced with item hash, model, pipeline, and job id, plus four separate, independently verifiable hashes (outcome / profile / validator / config).
+- **Survives the store being down** — the blocking quarantine outbox replays once the store recovers; optional telemetry is allowed to disappear, blocking evidence never is.
+
+| Without Assayer | With Assayer |
+|---|---|
+| Garbage ships because nobody looked. | `verify()` runs your checks; non-passing items never insert. |
+| A failed item vanishes on a store blip. | The durable outbox queues it; `replay()` claims rows atomically, reverts stale leases, dead-letters after 5 attempts. |
+| "Did this run pass?" — no proof. | Traced verdicts + per-item hashes you can re-derive. |
+| One combined hash you have to trust wholesale. | Four separate hashes — check the outcome, the profile, the validator, or the config independently. |
+
+## Part of a larger stack
+
+Assayer verifies; it pairs with **[Governator](https://github.com/cousingary/governator)**, which supervises agent runs with OS-enforced containment and a merge gate. Together with [Context Mode](https://github.com/mksglu/context-mode), [RTK](https://github.com/rtk-ai/rtk), and the Ponytail-derived minimalism ruleset, they form one bounded, frugal, recoverable agent stack — each tool owned independently. See Governator's [**The stack: one unit, four allies**](https://github.com/cousingary/governator#the-stack-one-unit-four-allies) section for the full picture.
 
 ## Flow
 1. Build checks from `assayer.checks` (schema, nonempty, max_len,
