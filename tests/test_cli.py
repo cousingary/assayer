@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -75,7 +76,18 @@ class ComputeStatsTests(unittest.TestCase):
         self.assertEqual(per_model, {})
 
 
+def _head_is_exact_tag() -> bool:
+    return subprocess.run(
+        ["git", "describe", "--tags", "--exact-match", "HEAD"],
+        capture_output=True,
+    ).returncode == 0
+
+
 class IdentityTests(unittest.TestCase):
+    @unittest.skipUnless(
+        _head_is_exact_tag(),
+        "release identity is only defined when HEAD is an exact release tag",
+    )
     def test_identity_is_complete_and_self_consistent(self):
         identity = assayer_identity()
         self.assertEqual(identity["version"], "1.1.11")
@@ -85,6 +97,14 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(identity["schema_version"], "0004")
         self.assertTrue(identity["clean"])
         self.assertIn("Python", identity["python_runtime"])
+
+    @unittest.skipIf(
+        _head_is_exact_tag(),
+        "gate only refuses when HEAD is not an exact release tag",
+    )
+    def test_identity_refuses_untagged_head(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            assayer_identity()
 
 
 if __name__ == "__main__":
